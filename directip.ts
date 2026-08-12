@@ -2,6 +2,7 @@ import { Platform } from 'obsidian';
 import { DirectIpConfig, SyncData } from './types';
 import { splitBinaryPayload, joinBinaryPayload, packFrame, unpackFrame } from './utils';
 import type ObsidianDecentralizedPlugin from './main';
+import { loadWs } from './ws-loader';
 
 // Heartbeat constants (mirror main.ts startHeartbeat)
 const HEARTBEAT_INTERVAL_MS = 5000;   // ping every 5 s
@@ -76,11 +77,11 @@ export class DirectIpServer {
     private async start(port: number): Promise<void> {
         let WebSocketServer: any;
         try {
-            // A bare require('ws') is invisible to rollup and survives into the bundle
-            // unresolved, so it throws MODULE_NOT_FOUND in any install without node_modules.
-            // A dynamic import is statically analysable (and inlined by inlineDynamicImports)
-            // while still deferring evaluation, so mobile never loads it.
-            ({ WebSocketServer } = await import('ws'));
+            // Goes through ws-loader.js rather than `await import('ws')`: a dynamic import gets
+            // its namespace evaluated at bundle load under inlineDynamicImports, which dragged
+            // ws's `crypto`/`stream` requires onto mobile and stopped the plugin loading there.
+            // loadWs() defers the real work to this call, which only desktop ever reaches.
+            ({ WebSocketServer } = loadWs());
         } catch (err: any) {
             this.plugin.log("Failed to load the 'ws' module:", err);
             throw new Error(`Could not load the WebSocket server module: ${err?.message || err}`);

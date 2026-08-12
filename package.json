@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "rollup --config rollup.config.mjs -w",
     "build": "rollup --config rollup.config.mjs --environment BUILD:production",
-    "test": "jest"
+    "test": "jest",
+    "test:mobile-load": "node scripts/check-mobile-load.mjs"
   },
   "keywords": [
     "obsidian-md",

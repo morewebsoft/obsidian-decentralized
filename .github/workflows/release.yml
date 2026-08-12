@@ -77,6 +77,11 @@ jobs:
       - name: Build plugin
         run: npm run build
 
+      # The unit tests run against the TypeScript sources, so only this catches a bundle that
+      # loads on desktop and dies on mobile — the exact shape of the ws/Node-builtin breakage.
+      - name: Verify the bundle loads on mobile
+        run: npm run test:mobile-load
+
       - name: Commit and Push Version Bump
         env:
           VERSION: ${{ inputs.version }}

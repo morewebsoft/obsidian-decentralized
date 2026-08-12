@@ -109,6 +109,23 @@ See [Offline Mode](#offline-mode-no-signaling-server) below.
 
 > **💡 Pro tip:** If two vaults ever look out of step, run a **Force Full Sync** — the `refresh-cw` ribbon icon, or the "Force full sync with a device" command — and pick the device to sync with.
 
+### Syncing three or more devices
+
+More than two devices is supported: every device keeps the others in its **Current Cluster**
+list, gossips that list to whoever it connects to, and retries all of them in the background.
+An entry that is powered off or unreachable is simply skipped — it does not knock the other
+links offline, and it does not change your status.
+
+Two things to know when you go past two devices:
+
+-   **Pairing is per pair of devices, not per cluster.** A key is established between the two
+    devices that scanned each other's code. If your phone paired with your desktop and later
+    with your laptop, the desktop and laptop still have no key with each other, so that
+    particular link is unencrypted until you pair those two directly.
+-   **With "strict security" on, every link must be paired.** A device introduced only by
+    gossip is refused with a notice asking you to pair. Pair each device with each other
+    device (or leave strict security off, its default).
+
 ## ⚙️ Configuration & Advanced Features
 
 All options live in the plugin's settings tab (`Settings` → `Obsidian Decentralized`). The **Mode** dropdown at the top controls how much is shown: `Auto` keeps things minimal with safe defaults, `Manual` exposes the common settings, and `Advanced` adds tuning and security options.
@@ -176,6 +193,7 @@ If a conflict occurs and a `(conflict)` file is created, a new icon (`swords`) w
     -   Check for firewalls or aggressive ad-blockers (like Pi-hole) that might be blocking the connection to the PeerJS signaling server or the P2P connection itself.
     -   Double-check that you have copied/pasted the Peer ID correctly.
 -   **Status is "❌ Sync Offline":** The plugin couldn't connect to the signaling server. It will automatically keep retrying with an increasing backoff delay. Check your internet connection.
+-   **A third device won't connect ("unable to reach the host"):** Extra IDs in the Current Cluster list are fine — unreachable ones are skipped without affecting the working links. If a specific link never comes up, check that both of those two devices are paired *with each other*; under "strict security" an unpaired link is refused. See [Syncing three or more devices](#syncing-three-or-more-devices).
 -   **LAN Discovery Doesn't Work:** This feature requires UDP multicast, which is sometimes blocked by corporate networks, VPNs, or strict firewall rules. In this case, fall back to connecting via ID/QR Code.
 
 ## 🤝 Contributing

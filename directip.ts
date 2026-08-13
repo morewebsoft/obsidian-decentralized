@@ -17,11 +17,13 @@ const LIVENESS_TIMEOUT_MS   = 20000;  // declare dead after 20 s of silence
  * which is shared with the encryption layer in main.ts so both agree on which
  * field holds the body.
  */
-function encodeMessage(msg: SyncData | any): string | ArrayBuffer {
+function encodeMessage(msg: SyncData | any): string | Uint8Array {
     const { header, body } = splitBinaryPayload(msg);
     if (!body) return JSON.stringify(msg);
-    const framed = packFrame(header, body);
-    return framed.buffer.slice(framed.byteOffset, framed.byteOffset + framed.byteLength);
+    // packFrame allocates the frame buffer itself and nothing else references it, so the
+    // Uint8Array goes to the socket as-is. Copying it out to a standalone ArrayBuffer was
+    // a full extra pass over every chunk of every file.
+    return packFrame(header, body);
 }
 
 function decodeMessage(data: string | ArrayBuffer | Uint8Array): any {
@@ -265,8 +267,10 @@ export class DirectIpServer {
             if (deviceId === excludePeerId) continue;
             if (entry.socket.readyState === 1 /* OPEN */) {
                 try {
-                    const finalEncoded = encoded instanceof ArrayBuffer ? encoded.slice(0) : encoded;
-                    entry.socket.send(finalEncoded);
+                    // One encoded buffer, shared by every recipient. ws only reads from it,
+                    // and nothing mutates it after encodeMessage returns, so the per-client
+                    // defensive copy this used to make bought nothing.
+                    entry.socket.send(encoded);
                 } catch (err) {
                     this.plugin.log('DirectIpServer: Broadcast send failed for client:', err);
                 }

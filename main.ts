@@ -95,7 +95,8 @@ import {
     packFrame,
     unpackFrame,
     sanitizeVaultPath,
-    taskQueueId
+    taskQueueId,
+    toExactArrayBuffer
 } from './utils';
 
 import { TimeoutManager } from './src/utils/Timeouts';
@@ -246,6 +247,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private hashCacheDirty: boolean = false;
     private queueDirty: boolean = false;
     private lastStateSaveAt: number = 0;
+    private lastQueueSaveAt: number = 0;
     public failedSyncs: FailedSync[] = [];
     private syncedHashes: Map<string, { hash: string, timestamp: number }> = new Map();
 
@@ -489,38 +491,63 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const MERKLE_SURROGATE_SIZE = 5 * 1024 * 1024;
         const tree: MerkleNode = { hash: '', children: {} };
         const allFiles = this.app.vault.getAllLoadedFiles();
-        let lastYield = Date.now();
 
+        // Two passes. The first resolves every file's hash, reading and digesting the
+        // uncached ones concurrently — this used to be a strictly serial read-then-digest
+        // per file, so a cold cache over a large vault spent almost all of its time with
+        // one I/O request outstanding. The second pass builds the tree from the resolved
+        // hashes, which is pure CPU and must stay ordered.
+        const syncable: TFile[] = [];
         for (const file of allFiles) {
-            if (file instanceof TFile && this.isPathSyncable(file.path)) {
-                let hash = this.syncedHashes.get(file.path)?.hash;
-                if (!hash) {
-                    if (file.stat.size > MERKLE_SURROGATE_SIZE) {
-                        // Tree-local surrogate only; never cached as a content hash.
-                        hash = `size-${file.stat.size}-mtime-${file.stat.mtime}`;
-                    } else {
-                        const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
-                        hash = await this.getHash(content);
-                        this.updateHashCache(file.path, hash);
-                    }
-                }
+            if (file instanceof TFile && this.isPathSyncable(file.path)) syncable.push(file);
+        }
 
-                // Hashing a whole vault can run for seconds; keep the UI responsive.
-                if (Date.now() - lastYield > 8) {
-                    await new Promise(r => setTimeout(r, 0));
-                    lastYield = Date.now();
-                }
+        const hashes = new Map<string, string>();
+        const uncached: TFile[] = [];
+        for (const file of syncable) {
+            const cached = this.syncedHashes.get(file.path)?.hash;
+            if (cached) {
+                hashes.set(file.path, cached);
+            } else if (file.stat.size > MERKLE_SURROGATE_SIZE) {
+                // Tree-local surrogate only; never cached as a content hash.
+                hashes.set(file.path, `size-${file.stat.size}-mtime-${file.stat.mtime}`);
+            } else {
+                uncached.push(file);
+            }
+        }
 
-                const parts = file.path.split('/');
-                let current = tree;
-                for (let i = 0; i < parts.length; i++) {
-                    const part = parts[i];
-                    if (!current.children) current.children = {};
-                    if (!current.children[part]) current.children[part] = { hash: '' };
-                    current = current.children[part];
-                    if (i === parts.length - 1) {
-                        current.hash = hash;
-                    }
+        if (uncached.length > 0) {
+            this.log(`Merkle: hashing ${uncached.length} uncached file(s).`);
+            await mapWithConcurrency(uncached, 8, async (file) => {
+                const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
+                const hash = await this.getHash(content);
+                this.updateHashCache(file.path, hash);
+                hashes.set(file.path, hash);
+            });
+        }
+
+        let lastYield = Date.now();
+        for (const file of syncable) {
+            const hash = hashes.get(file.path);
+            // A file that vanished mid-build has no hash; leaving it out of the tree is
+            // correct — it is no longer part of the vault we are describing.
+            if (!hash) continue;
+
+            // Tree insertion is cheap but a huge vault still adds up; keep the UI alive.
+            if (Date.now() - lastYield > 8) {
+                await new Promise(r => setTimeout(r, 0));
+                lastYield = Date.now();
+            }
+
+            const parts = file.path.split('/');
+            let current = tree;
+            for (let i = 0; i < parts.length; i++) {
+                const part = parts[i];
+                if (!current.children) current.children = {};
+                if (!current.children[part]) current.children[part] = { hash: '' };
+                current = current.children[part];
+                if (i === parts.length - 1) {
+                    current.hash = hash;
                 }
             }
         }
@@ -1088,14 +1115,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async decryptPayload(encryptedPayload: any, peerId: string): Promise<any> {
         const key = await this.getCryptoKey(peerId);
         if (!key) throw new Error(`No decryption key for peer ${peerId}`);
+        // Views, not copies. This used to normalise a Uint8Array into its own ArrayBuffer
+        // and then slice off the IV, so every encrypted message — including every chunk of
+        // every file — was copied twice before decryption even started.
         const raw = encryptedPayload.data;
-        const buf: ArrayBuffer = raw instanceof ArrayBuffer
-            ? raw
-            : (raw as Uint8Array).buffer.slice((raw as Uint8Array).byteOffset, (raw as Uint8Array).byteOffset + (raw as Uint8Array).byteLength);
-        if (buf.byteLength < 13) throw new Error('Decryption failed: frame too short');
+        const frame: Uint8Array = raw instanceof ArrayBuffer ? new Uint8Array(raw) : (raw as Uint8Array);
+        if (frame.byteLength < 13) throw new Error('Decryption failed: frame too short');
         try {
-            const iv = new Uint8Array(buf, 0, 12);
-            const decrypted = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, buf.slice(12));
+            const iv = frame.subarray(0, 12);
+            const ciphertext = frame.subarray(12);
+            const decrypted = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
             const { header, body } = unpackFrame(decrypted);
             return joinBinaryPayload(header, body);
         } catch (e) {
@@ -1174,6 +1203,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private addToQueue(peerId: string | null, data: SyncData) {
         const priority = this.computePriority(data);
+        // Keep the QueueManager's limit in step with the adaptive one. It used to be
+        // synced only in processQueue(), which runs when a full sync COMPLETES — so the
+        // entire transfer phase (and all day-to-day sends) drained at the QueueManager's
+        // constructor default of 3 concurrent items instead of the intended 16–50.
+        this.queueManager.setConcurrencyLimit(this.getConcurrencyLimit());
         this.queueManager.addToQueue({ peerId, data, retries: 0, priority });
         // 'data' items are not persisted, so only the queue file is affected here.
         this.scheduleQueueSave();
@@ -1181,6 +1215,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private addToQueueTask(peerId: string | null, task: SyncTask) {
         const priority = this.computePriorityTask(task);
+        this.queueManager.setConcurrencyLimit(this.getConcurrencyLimit());
         this.queueManager.addToQueue({ id: this.taskQueueId(peerId, task), peerId, task, retries: 0, priority });
         this.scheduleQueueSave();
     }
@@ -1358,6 +1393,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.log(`Network stable. Increasing chunk size to ${this.currentChunkSize}`);
                 }
                 this.successfulTransfersSinceLastIncrease = 0;
+                // Apply the raised ceiling to items already sitting in the queue.
+                this.queueManager.setConcurrencyLimit(this.getConcurrencyLimit());
             }
         } else {
             const newLimit = Math.max(1, Math.floor(this.currentConcurrency * 0.7));
@@ -1373,6 +1410,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             }
             this.successfulTransfersSinceLastIncrease = 0;
+            // Back off in-flight admission immediately, not on the next enqueue.
+            this.queueManager.setConcurrencyLimit(this.getConcurrencyLimit());
         }
     }
 
@@ -1491,34 +1530,49 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[task.newPath] : undefined;
                     item.data = { type: 'file-rename', oldPath: task.oldPath, newPath: task.newPath, transferId: this.generateTransferId(task.newPath), versionVector: vv };
                 } else if (task.taskType === 'send-file-batch') {
-                    const packedFiles: PackedFile[] = [];
-                    for (const path of task.paths) {
+                    // Read and compress the batch's files concurrently. Serially this was
+                    // one outstanding vault read at a time for up to 500 files, and each
+                    // read is I/O the renderer just waits on.
+                    const settled = await mapWithConcurrency(task.paths, 8, async (path): Promise<PackedFile | null> => {
                         const file = this.app.vault.getAbstractFileByPath(path);
-                        if (file instanceof TFile) {
-                            let content: string | ArrayBuffer = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
-                            let encoding: 'utf8' | 'binary' | 'base64' = this.isBinary(file.extension) ? 'binary' : 'utf8';
-                            let isCompressedText = false;
-                            
-                            if (!this.isBinary(file.extension) && this.settings.enableCompression) {
-                                content = compressText(content as string);
-                                encoding = 'binary';
-                                isCompressedText = true;
-                            }
-                            
-                            if (typeof content === 'string') {
-                                const encoded = ObsidianDecentralizedPlugin.textEncoder.encode(content);
-                                content = encoded;
-                                encoding = 'binary';
-                            }
-                            
-                            packedFiles.push({
-                                path: file.path,
-                                mtime: file.stat.mtime,
-                                isCompressed: isCompressedText,
-                                encoding,
-                                content: content as ArrayBuffer
-                            });
+                        if (!(file instanceof TFile)) return null;
+
+                        const isBinaryFile = this.isBinary(file.extension);
+                        let content: string | ArrayBuffer | Uint8Array = isBinaryFile
+                            ? await this.app.vault.readBinary(file)
+                            : await this.app.vault.read(file);
+                        let encoding: 'utf8' | 'binary' | 'base64' = isBinaryFile ? 'binary' : 'utf8';
+                        let isCompressedText = false;
+
+                        if (!isBinaryFile && this.settings.enableCompression) {
+                            content = compressText(content as string);
+                            encoding = 'binary';
+                            isCompressedText = true;
                         }
+
+                        if (typeof content === 'string') {
+                            content = ObsidianDecentralizedPlugin.textEncoder.encode(content);
+                            encoding = 'binary';
+                        }
+
+                        return {
+                            path: file.path,
+                            mtime: file.stat.mtime,
+                            isCompressed: isCompressedText,
+                            encoding,
+                            content: content as ArrayBuffer
+                        };
+                    });
+
+                    // A read failure has to abort the whole task, exactly as it did when
+                    // these reads were awaited inline. The finally block reports every path
+                    // in the task to the batch, so swallowing one file's error here would
+                    // mark it delivered and the peer would drop it from its pending pulls —
+                    // the sync would then claim success with the file missing on both sides.
+                    const packedFiles: PackedFile[] = [];
+                    for (const result of settled) {
+                        if (result.status === 'rejected') throw result.reason;
+                        if (result.value) packedFiles.push(result.value);
                     }
                     if (packedFiles.length > 0) {
                         item.data = {
@@ -2237,11 +2291,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // Unwrap deflated sync control messages (see sendSyncMessage for why)
         if (data.type === 'sync-control-binary' && data.data) {
             try {
-                const raw = data.data;
-                const buf: ArrayBuffer = raw instanceof ArrayBuffer
-                    ? raw
-                    : (raw as Uint8Array).buffer.slice((raw as Uint8Array).byteOffset, (raw as Uint8Array).byteOffset + (raw as Uint8Array).byteLength);
-                data = JSON.parse(decompressText(buf));
+                // decompressText reads a view in place; the copy this used to make was a
+                // full duplicate of every manifest, which is the largest control message.
+                data = JSON.parse(decompressText(data.data));
             } catch (e) { this.log('Failed to decode sync-control-binary payload:', e); return; }
         }
         this.log("Received data:", data.type, "from", conn?.peer);
@@ -2761,7 +2813,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async saveQueueState(force = false) {
         if (!this.queueManager) return;
         if (!force && !this.queueDirty) return;
+        if (!force) {
+            // Same reasoning as saveState: a sync enqueues and drains thousands of items,
+            // and every one of them re-serialised the whole queue 2 s later. The file only
+            // matters on restart, so during a sync it is written far less often.
+            const minInterval = this.syncState.isSyncing ? 10000 : 0;
+            if (minInterval && Date.now() - this.lastQueueSaveAt < minInterval) {
+                this.debouncedSaveQueue();
+                return;
+            }
+        }
         this.queueDirty = false;
+        this.lastQueueSaveAt = Date.now();
         try {
             // Only 'task' items are persistable: they name a vault path and are re-derived
             // from the vault on replay. 'data' items can hold an ArrayBuffer, which
@@ -2878,7 +2941,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const chunk: ArrayBuffer | Uint8Array = encryptFor
                     ? new Uint8Array(fileContent, start, end - start)
                     : fileContent.slice(start, end);
-                const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk as ArrayBuffer };
+                const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk };
 
                 const encPayload: any = encryptFor ? await this.encryptPayload(chunkPayload, peerId) : chunkPayload;
 
@@ -3011,7 +3074,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         if (!transfer.received[payload.index]) {
             transfer.received[payload.index] = 1;
-            transfer.buffer.set(new Uint8Array(payload.data), offset);
+            // The frame decoder hands back a view; wrapping a view in `new Uint8Array()`
+            // would copy it a second time on the way into the reassembly buffer.
+            const bytes = payload.data instanceof Uint8Array ? payload.data : new Uint8Array(payload.data);
+            transfer.buffer.set(bytes, offset);
             transfer.receivedCount++;
             this.syncState.bytesTransferred += payload.data.byteLength;
         }
@@ -3386,19 +3452,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async applyFileBatchBinary(data: FileBatchBinaryPayload): Promise<{ succeeded: string[], failed: string[] }> {
         const results = { succeeded: [] as string[], failed: [] as string[] };
-        let buffer: ArrayBuffer;
-        
-        if (data.data instanceof Uint8Array) {
-            buffer = data.data.buffer.slice(data.data.byteOffset, data.data.byteOffset + data.data.byteLength);
-        } else if (typeof data.data === 'string') {
-            buffer = base64ToArrayBuffer(data.data);
-        } else {
-            buffer = data.data;
-        }
+        // A Uint8Array body is parsed in place; unpackTLVToFiles slices out each file's
+        // content, so nothing keeps the batch alive afterwards.
+        const packed: ArrayBuffer | Uint8Array = typeof data.data === 'string'
+            ? base64ToArrayBuffer(data.data)
+            : data.data;
 
         let unpacked: PackedFile[];
         try {
-            unpacked = unpackTLVToFiles(buffer);
+            unpacked = unpackTLVToFiles(packed);
         } catch (e) {
             this.log("Failed to unpack TLV binary batch", e);
             throw e;
@@ -3417,16 +3479,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     if (fileData.isCompressed) {
                         contentStr = decompressText(fileData.content);
                     } else {
-                        contentBuf = fileData.content instanceof Uint8Array ?
-                            fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) :
-                            fileData.content;
+                        contentBuf = toExactArrayBuffer(fileData.content);
                     }
                 } else if (fileData.encoding === 'base64') {
                     // For Base64 encoded ArrayBuffers (fallback/DirectIP)
-                    contentBuf = typeof fileData.content === 'string' ? base64ToArrayBuffer(fileData.content) :
-                        (fileData.content instanceof Uint8Array ?
-                            fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) :
-                            fileData.content);
+                    contentBuf = typeof fileData.content === 'string'
+                        ? base64ToArrayBuffer(fileData.content)
+                        : toExactArrayBuffer(fileData.content);
                 } else {
                     contentStr = ObsidianDecentralizedPlugin.textDecoder.decode(fileData.content);
                 }
@@ -4399,15 +4458,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // Set lookup against a module-level constant. This allocated a fresh 10-element
     // array literal on every call, and it is called several times per file per sync.
     public isBinary(extension: string): boolean { return !TEXT_EXTENSIONS.has((extension || '').toLowerCase()); }
-    private async areArrayBuffersEqual(buf1: ArrayBuffer, buf2: ArrayBuffer): Promise<boolean> { 
-        if (buf1.byteLength !== buf2.byteLength) return false; 
+    private async areArrayBuffersEqual(buf1: ArrayBuffer, buf2: ArrayBuffer): Promise<boolean> {
+        if (buf1.byteLength !== buf2.byteLength) return false;
         if (buf1.byteLength < 50 * 1024) {
-            const view1 = new Uint8Array(buf1); 
-            const view2 = new Uint8Array(buf2); 
-            for (let i = 0; i < buf1.byteLength; i++) { 
-                if (view1[i] !== view2[i]) return false; 
-            } 
-            return true; 
+            // Compare 4 bytes at a time. Identical files are the common case here — this
+            // runs on every incoming update — so the loop almost always runs to the end.
+            const words = buf1.byteLength >>> 2;
+            const w1 = new Uint32Array(buf1, 0, words);
+            const w2 = new Uint32Array(buf2, 0, words);
+            for (let i = 0; i < words; i++) {
+                if (w1[i] !== w2[i]) return false;
+            }
+            const b1 = new Uint8Array(buf1);
+            const b2 = new Uint8Array(buf2);
+            for (let i = words << 2; i < buf1.byteLength; i++) {
+                if (b1[i] !== b2[i]) return false;
+            }
+            return true;
         }
         const hash1 = await this.getHash(buf1);
         const hash2 = await this.getHash(buf2);

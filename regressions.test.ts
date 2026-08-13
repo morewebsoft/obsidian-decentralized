@@ -15,6 +15,10 @@ import {
     joinBinaryPayload,
     packFrame,
     unpackFrame,
+    packFilesToTLV,
+    unpackTLVToFiles,
+    toExactArrayBuffer,
+    PackedFile,
 } from './utils';
 import { QueueManager } from './src/core/QueueManager';
 import { TimeoutManager } from './src/utils/Timeouts';
@@ -184,6 +188,46 @@ describe('empty binary bodies', () => {
         expect(rebuilt.__emptyBody).toBeUndefined();
     });
 
+    it('materialises file-update content even though the frame body is a view', () => {
+        // unpackFrame hands back a zero-copy view into the decoded frame. applyFileUpdate
+        // branches on `content instanceof ArrayBuffer` and passes content straight to the
+        // vault's binary writers, so this one field must still arrive as a real
+        // ArrayBuffer — a view here would make every binary update take the text path.
+        const bytes = new Uint8Array([7, 8, 9]);
+        const msg = {
+            type: 'file-update',
+            path: 'x.bin',
+            encoding: 'binary',
+            mtime: 1,
+            transferId: 't3',
+            content: bytes.buffer,
+        };
+
+        const { header, body } = splitBinaryPayload(msg);
+        const framed = packFrame(header, body);
+        const unpacked = unpackFrame(framed.buffer.slice(framed.byteOffset, framed.byteOffset + framed.byteLength));
+        expect(unpacked.body).toBeInstanceOf(Uint8Array);
+
+        const rebuilt = joinBinaryPayload(unpacked.header, unpacked.body);
+        expect(rebuilt.content).toBeInstanceOf(ArrayBuffer);
+        expect(new Uint8Array(rebuilt.content)).toEqual(bytes);
+    });
+
+    it('passes bulk bodies through as views rather than copying them', () => {
+        // file-chunk-data is the hot path: one of these per 512 KB of every large file.
+        // Its consumer reads raw bytes, so it must not be re-materialised.
+        const payload = new Uint8Array([1, 2, 3, 4, 5]);
+        const { header, body } = splitBinaryPayload({
+            type: 'file-chunk-data', transferId: 't', index: 0, data: payload.buffer,
+        });
+        const framed = packFrame(header, body);
+        const unpacked = unpackFrame(framed.buffer.slice(framed.byteOffset, framed.byteOffset + framed.byteLength));
+        const rebuilt = joinBinaryPayload(unpacked.header, unpacked.body);
+
+        expect(rebuilt.data).toBeInstanceOf(Uint8Array);
+        expect(new Uint8Array(rebuilt.data)).toEqual(payload);
+    });
+
     it('still round-trips a non-empty binary body', () => {
         const bytes = new Uint8Array([1, 2, 3, 4]);
         const msg = {
@@ -201,5 +245,83 @@ describe('empty binary bodies', () => {
         const rebuilt = joinBinaryPayload(unpacked.header, unpacked.body);
 
         expect(new Uint8Array(rebuilt.content)).toEqual(bytes);
+    });
+});
+
+describe('TLV unpacking from a view', () => {
+    const encoder = new TextEncoder();
+    const files: PackedFile[] = [
+        { path: 'a/one.md', mtime: 111, isCompressed: true, encoding: 'utf8', content: encoder.encode('first') },
+        { path: 'two.png', mtime: 222, isCompressed: false, encoding: 'binary', content: new Uint8Array([9, 8, 7, 6]) },
+    ];
+
+    const expectRoundTrip = (unpacked: PackedFile[]) => {
+        expect(unpacked.length).toBe(2);
+        expect(unpacked[0].path).toBe('a/one.md');
+        expect(unpacked[0].isCompressed).toBe(true);
+        expect(new Uint8Array(unpacked[0].content)).toEqual(new Uint8Array(files[0].content));
+        expect(unpacked[1].path).toBe('two.png');
+        expect(unpacked[1].encoding).toBe('binary');
+        expect(new Uint8Array(unpacked[1].content)).toEqual(new Uint8Array(files[1].content));
+    };
+
+    it('parses a batch given as a bare ArrayBuffer', () => {
+        expectRoundTrip(unpackTLVToFiles(packFilesToTLV(files)));
+    });
+
+    it('parses a batch given as a view at a non-zero byte offset', () => {
+        // The batch body arrives as a view into a larger decoded frame, so its bytes start
+        // partway into the underlying buffer. Reading through a DataView built on the raw
+        // buffer instead of the view would parse the wrong bytes entirely.
+        const packed = new Uint8Array(packFilesToTLV(files));
+        const framed = new Uint8Array(packed.byteLength + 17);
+        framed.set(packed, 17);
+        const view = framed.subarray(17);
+
+        expect(view.byteOffset).toBe(17);
+        expectRoundTrip(unpackTLVToFiles(view));
+    });
+
+    it('bounds-checks against the view, not its backing buffer', () => {
+        // A truncated batch must be refused even when the underlying buffer has spare
+        // bytes after it that a naive length check would happily read into.
+        const packed = new Uint8Array(packFilesToTLV(files));
+        const backing = new Uint8Array(packed.byteLength + 64);
+        backing.set(packed, 0);
+        const truncated = backing.subarray(0, packed.byteLength - 3);
+
+        expect(() => unpackTLVToFiles(truncated)).toThrow(/TLV/);
+    });
+});
+
+describe('toExactArrayBuffer', () => {
+    it('returns the backing buffer untouched when the view already spans it', () => {
+        const bytes = new Uint8Array([1, 2, 3]);
+        expect(toExactArrayBuffer(bytes)).toBe(bytes.buffer);
+    });
+
+    it('copies out only the view when it is a window into a larger buffer', () => {
+        const backing = new Uint8Array([0, 0, 1, 2, 3, 0]);
+        const window = backing.subarray(2, 5);
+        const out = toExactArrayBuffer(window);
+
+        expect(out.byteLength).toBe(3);
+        expect(new Uint8Array(out)).toEqual(new Uint8Array([1, 2, 3]));
+    });
+
+    it('passes an ArrayBuffer straight through', () => {
+        const buf = new ArrayBuffer(4);
+        expect(toExactArrayBuffer(buf)).toBe(buf);
+    });
+});
+
+describe('decompressText accepts a view', () => {
+    it('inflates a view without needing it copied out first', () => {
+        const text = 'sync '.repeat(500);
+        const compressed = new Uint8Array(compressText(text));
+        const backing = new Uint8Array(compressed.byteLength + 8);
+        backing.set(compressed, 8);
+
+        expect(decompressText(backing.subarray(8))).toBe(text);
     });
 });

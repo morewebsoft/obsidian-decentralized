@@ -280,7 +280,8 @@ export type FileChunkDataPayload = {
     type: 'file-chunk-data';
     transferId: string;
     index: number;
-    data: ArrayBuffer;
+    /** A received chunk arrives as a zero-copy view over the decoded frame. */
+    data: ArrayBuffer | Uint8Array;
 };
 
 export type FileBatchBinaryPayload = {

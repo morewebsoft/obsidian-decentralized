@@ -27,7 +27,7 @@ export function compressText(content: string): ArrayBuffer {
  */
 export const MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024;
 
-export function decompressText(data: ArrayBuffer, maxBytes: number = MAX_DECOMPRESSED_BYTES): string {
+export function decompressText(data: ArrayBuffer | Uint8Array, maxBytes: number = MAX_DECOMPRESSED_BYTES): string {
     try {
         // pako has no output-size option, so inflate in chunks and stop as soon as the
         // running total crosses the limit rather than after the allocation has happened.
@@ -42,7 +42,8 @@ export function decompressText(data: ArrayBuffer, maxBytes: number = MAX_DECOMPR
             }
             (this as any).chunks.push(chunk);
         };
-        inflater.push(new Uint8Array(data), true);
+        // A view is pushed as-is; wrapping one in `new Uint8Array()` would copy it.
+        inflater.push(data instanceof Uint8Array ? data : new Uint8Array(data), true);
 
         if (overflowed) {
             throw new Error(`decompressed payload exceeds the ${Math.round(maxBytes / (1024 * 1024))} MB limit`);
@@ -212,8 +213,21 @@ export function splitBinaryPayload(msg: any): { header: any; body: Uint8Array | 
     return { header, body };
 }
 
+/**
+ * Message types whose binary body is consumed as raw bytes and so can keep the
+ * zero-copy view unpackFrame hands back. Everything else is materialised into its
+ * own ArrayBuffer, because `file-update.content` is branched on with
+ * `instanceof ArrayBuffer` and is handed straight to the vault's binary writers.
+ */
+const VIEW_SAFE_BODY_TYPES = new Set([
+    'file-chunk-data',
+    'file-batch-binary',
+    'encrypted-frame',
+    'sync-control-binary',
+]);
+
 /** Reattach a binary body to the field its message type expects. */
-export function joinBinaryPayload(header: any, body: ArrayBuffer | null): any {
+export function joinBinaryPayload(header: any, body: Uint8Array | ArrayBuffer | null): any {
     if (!header || typeof header !== 'object') return header;
     const field = BINARY_BODY_FIELD[header.type];
     if (!field) return header;
@@ -223,7 +237,13 @@ export function joinBinaryPayload(header: any, body: ArrayBuffer | null): any {
         header[field] = new ArrayBuffer(0);
         return header;
     }
-    if (body) header[field] = body;
+    if (body) {
+        if (body instanceof Uint8Array && !VIEW_SAFE_BODY_TYPES.has(header.type)) {
+            header[field] = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
+        } else {
+            header[field] = body;
+        }
+    }
     return header;
 }
 
@@ -242,8 +262,16 @@ export function packFrame(header: any, body: Uint8Array | null): Uint8Array {
     return out;
 }
 
-/** Inverse of packFrame. Throws a PROTOCOL_ERROR SyncError on a truncated frame. */
-export function unpackFrame(buffer: ArrayBuffer): { header: any; body: ArrayBuffer | null } {
+/**
+ * Inverse of packFrame. Throws a PROTOCOL_ERROR SyncError on a truncated frame.
+ *
+ * The body is returned as a VIEW into `buffer`, not a copy. On the chunk path this
+ * frame is decrypted (or read off the socket) immediately before, so the buffer is
+ * freshly allocated and nobody else holds it — copying the body back out of it was a
+ * full extra pass over every chunk of every file. joinBinaryPayload materialises the
+ * view for the message types that need a real ArrayBuffer.
+ */
+export function unpackFrame(buffer: ArrayBuffer): { header: any; body: Uint8Array | null } {
     if (buffer.byteLength < 4) {
         throw new SyncError(
             SyncErrorCategory.PROTOCOL_ERROR,
@@ -263,7 +291,7 @@ export function unpackFrame(buffer: ArrayBuffer): { header: any; body: ArrayBuff
     }
     const header = JSON.parse(textDecoder.decode(new Uint8Array(buffer, 4, headerLen)));
     const bodyStart = 4 + headerLen;
-    const body = bodyStart < buffer.byteLength ? buffer.slice(bodyStart) : null;
+    const body = bodyStart < buffer.byteLength ? new Uint8Array(buffer, bodyStart) : null;
     return { header, body };
 }
 
@@ -282,6 +310,21 @@ export function taskQueueId(peerId: string | null, task: SyncTask): string {
         ? `${task.oldPath}\0${task.newPath}`
         : (task.taskType === 'send-file-batch' ? `${task.batchId}\0${task.paths.join('\0')}` : task.path);
     return `${peerId || '*'}\0${task.taskType}\0${target}`;
+}
+
+/**
+ * The ArrayBuffer behind a view, copying only when the view does not already span its
+ * whole buffer. Callers that hand a buffer to an API demanding an ArrayBuffer (the
+ * vault's binary writers, mainly) were unconditionally slicing, which copied every file
+ * again even when the view was already exact — which it is for anything that came out
+ * of `slice()` or a fresh allocation.
+ */
+export function toExactArrayBuffer(view: ArrayBuffer | Uint8Array): ArrayBuffer {
+    if (view instanceof ArrayBuffer) return view;
+    if (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+        return view.buffer as ArrayBuffer;
+    }
+    return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer;
 }
 
 export interface PackedFile {
@@ -342,15 +385,25 @@ export function packFilesToTLV(files: PackedFile[]): ArrayBuffer {
     }
 }
 
-export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
+/**
+ * @param input the packed batch. A Uint8Array is read in place: the caller's body is
+ *   already a view over the decoded frame, and copying it out just to parse it meant a
+ *   full extra pass over every batch. Each file's content is still sliced into its own
+ *   buffer below, so nothing retains the batch after this returns.
+ */
+export function unpackTLVToFiles(input: ArrayBuffer | Uint8Array): PackedFile[] {
     try {
-        const view = new DataView(buffer);
+        const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+        // Offsets below are relative to the start of the packed data, and DataView
+        // indexes relative to its own byteOffset, so a view lands on the same bytes.
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const totalLength = bytes.byteLength;
         const files: PackedFile[] = [];
         let offset = 0;
-        
-        while (offset < buffer.byteLength) {
+
+        while (offset < totalLength) {
             // 1. Check if we can read the path length (2 bytes)
-            if (offset + 2 > buffer.byteLength) {
+            if (offset + 2 > totalLength) {
                 throw new SyncError(
                     SyncErrorCategory.PROTOCOL_ERROR,
                     `TLV unpack failed: Truncated buffer when reading path length at offset ${offset}`,
@@ -359,9 +412,9 @@ export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
                 );
             }
             const pathLen = view.getUint16(offset, true); offset += 2;
-            
+
             // 2. Check if we can read the path bytes (pathLen bytes)
-            if (offset + pathLen > buffer.byteLength) {
+            if (offset + pathLen > totalLength) {
                 throw new SyncError(
                     SyncErrorCategory.PROTOCOL_ERROR,
                     `TLV unpack failed: Truncated buffer when reading path of length ${pathLen} at offset ${offset}`,
@@ -369,11 +422,11 @@ export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
                     'Re-request the file sync batch.'
                 );
             }
-            const pathBytes = new Uint8Array(buffer, offset, pathLen);
+            const pathBytes = bytes.subarray(offset, offset + pathLen);
             const path = textDecoder.decode(pathBytes); offset += pathLen;
-            
+
             // 3. Check if we can read mtime (8 bytes), isCompressed (1 byte), encFlag (1 byte), and contentLen (4 bytes)
-            if (offset + 14 > buffer.byteLength) {
+            if (offset + 14 > totalLength) {
                 throw new SyncError(
                     SyncErrorCategory.PROTOCOL_ERROR,
                     `TLV unpack failed: Truncated buffer when reading metadata at offset ${offset}`,
@@ -392,7 +445,7 @@ export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
             const contentLen = view.getUint32(offset, true); offset += 4;
             
             // 4. Check if we can read content bytes (contentLen bytes)
-            if (offset + contentLen > buffer.byteLength) {
+            if (offset + contentLen > totalLength) {
                 throw new SyncError(
                     SyncErrorCategory.PROTOCOL_ERROR,
                     `TLV unpack failed: Truncated buffer when reading content of length ${contentLen} at offset ${offset}`,
@@ -401,7 +454,7 @@ export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
                 );
             }
             // Use slice to create an independent copy and prevent retaining the entire batch buffer
-            const content = new Uint8Array(buffer.slice(offset, offset + contentLen));
+            const content = bytes.slice(offset, offset + contentLen);
             offset += contentLen;
             
             files.push({ path, mtime, isCompressed, encoding, content });

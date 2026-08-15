@@ -235,6 +235,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // Network-change handling (Phase 3.2)
     private networkChangeHandler: (() => void) | null = null;
     private peerReconnectFallbackTimeout: number | null = null;
+    // Last time each distinct notice text was shown, so a flapping network cannot
+    // stack the same toast over and over.
+    private recentNotices: Map<string, number> = new Map();
     private statePath: string;
     private hashCachePath: string;
     public manualPingStart: Map<string, number> = new Map();
@@ -827,7 +830,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return newLock;
     }
 
-    public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' | 'warning' = 'info', timeout?: number) {
+    public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' | 'warning' | 'transient' = 'info', timeout?: number) {
+        // 'transient' is connection-lifecycle churn (dropped/reconnecting/closed). A flaky
+        // network fires it in a loop, so it is strictly opt-in via showToasts — the status
+        // bar already reports the same state continuously.
+        if (level === 'transient' && !this.settings.showToasts) {
+            this.log(`[notice suppressed] ${message}`);
+            return;
+        }
+
+        // Collapse repeats of the identical message. Without this a reconnect loop stacks
+        // the same toast every few seconds regardless of which level it carries.
+        const NOTICE_DEDUPE_MS = level === 'transient' ? 60000 : 15000;
+        const now = Date.now();
+        const lastShown = this.recentNotices.get(message);
+        if (lastShown !== undefined && now - lastShown < NOTICE_DEDUPE_MS) {
+            this.log(`[notice deduped] ${message}`);
+            return;
+        }
+        if (this.recentNotices.size > 100) {
+            for (const [text, at] of this.recentNotices) {
+                if (now - at > NOTICE_DEDUPE_MS) this.recentNotices.delete(text);
+            }
+        }
+        this.recentNotices.set(message, now);
+
         // Errors, warnings and connection/conflict events always surface, regardless of
         // showToasts — that is what the setting's own description promises, and gating them
         // left a fresh install completely mute (including failures the user must act on).
@@ -1983,7 +2010,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.peer.on('connection', (conn) => { this.log("Incoming PeerJS connection from:", conn.peer); this.setupConnection(conn); });
         this.peer.on('error', (err) => { clearTimeout(connectionTimeout); this.handlePeerError(err); });
         this.peer.on('disconnected', () => {
-            this.showNotice('Sync network disconnected. Attempting to reconnect...', 'important');
+            this.showNotice('Sync network disconnected. Attempting to reconnect...', 'transient');
             this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' });
             // Attempt lightweight reconnect first (Phase 3.1)
             if (this.peer && !this.peer.destroyed) {
@@ -2000,7 +2027,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }, 15000);
             }
         });
-        this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'important'); this.handlePeerError(new Error("Peer closed.")); });
+        this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'transient'); this.handlePeerError(new Error("Peer closed.")); });
     }
 
     private handlePeerError(err: any) {
@@ -2037,7 +2064,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
         this.peerInitAttempts++;
         const backoff = Math.min(30000, this.peerInitAttempts * 2000);
-        this.showNotice(`Sync connection failed. Retrying in ${backoff / 1000}s...`, 'info');
+        this.showNotice(`Sync connection failed. Retrying in ${backoff / 1000}s...`, 'transient');
     
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.peerInitRetryTimeout = window.setTimeout(() => {
@@ -2121,7 +2148,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             this.log(`Peer disconnected: ${peerId}`);
             if (peerId === this.settings.companionPeerId) {
-                this.showNotice(`Paired Device disconnected. Will try to reconnect automatically.`, 'important');
+                this.showNotice(`Paired Device disconnected. Will try to reconnect automatically.`, 'transient');
             }
             this.log("Connection closed, ensuring connection attempts continue.");
             this.tryToConnectToClusterPeers();
@@ -2129,7 +2156,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         conn.on('error', (err) => { 
             this.pendingConnections.delete(conn.peer);
             console.error(`Connection error with ${conn.peer}:`, err); 
-            this.showNotice(`Connection error with a peer.`, 'error'); 
+            this.showNotice(`Connection error with a peer.`, 'transient'); 
         });
     }
 
@@ -4680,4 +4707,4 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 }
 
 
-
+

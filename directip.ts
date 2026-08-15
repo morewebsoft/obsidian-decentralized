@@ -609,6 +609,6 @@ export class DirectIpClient {
             this.ws.close();
             this.ws = null;
         }
-        this.plugin.showNotice("Disconnected from Offline Host.", 'important', 3000);
+        this.plugin.showNotice("Disconnected from Offline Host.", 'transient', 3000);
     }
 }

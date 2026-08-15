@@ -99,9 +99,9 @@ import {
     toExactArrayBuffer
 } from './utils';
 
-import { TimeoutManager } from './src/utils/Timeouts';
-import { QueueManager } from './src/core/QueueManager';
-import { ConnectionManager } from './src/core/ConnectionManager';
+import { TimeoutManager } from './utils/Timeouts';
+import { QueueManager } from './core/QueueManager';
+import { ConnectionManager } from './core/ConnectionManager';
 
 /** Extensions treated as text (everything else is binary). */
 const TEXT_EXTENSIONS = new Set(['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml']);
@@ -832,16 +832,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' | 'warning' | 'transient' = 'info', timeout?: number) {
         // 'transient' is connection-lifecycle churn (dropped/reconnecting/closed). A flaky
-        // network fires it in a loop, so it is strictly opt-in via showToasts — the status
-        // bar already reports the same state continuously.
-        if (level === 'transient' && !this.settings.showToasts) {
+        // network fires it in a loop, so it never reaches a toast at all — not even when
+        // showToasts is on. The status bar reports the very same state continuously
+        // ('Reconnecting...', 'Retrying connection...', 'Error: ...'), so nothing is lost
+        // and there is no setting that can turn this spam back on.
+        if (level === 'transient') {
             this.log(`[notice suppressed] ${message}`);
             return;
         }
 
         // Collapse repeats of the identical message. Without this a reconnect loop stacks
         // the same toast every few seconds regardless of which level it carries.
-        const NOTICE_DEDUPE_MS = level === 'transient' ? 60000 : 15000;
+        const NOTICE_DEDUPE_MS = 15000;
         const now = Date.now();
         const lastShown = this.recentNotices.get(message);
         if (lastShown !== undefined && now - lastShown < NOTICE_DEDUPE_MS) {

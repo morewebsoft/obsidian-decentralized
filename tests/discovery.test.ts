@@ -9,8 +9,8 @@ Object.defineProperty(global, 'window', {
     writable: true
 });
 
-import { DesktopLANDiscovery } from './discovery';
-import { PeerInfo } from './types';
+import { DesktopLANDiscovery } from '../src/discovery';
+import { PeerInfo } from '../src/types';
 
 describe('DesktopLANDiscovery', () => {
     let discovery: DesktopLANDiscovery;

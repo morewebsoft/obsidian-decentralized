@@ -10,7 +10,7 @@ import {
     joinBinaryPayload,
     packFrame,
     unpackFrame
-} from './utils';
+} from '../src/utils';
 
 // Mock window.btoa and window.atob for Node environment
 if (typeof window === 'undefined') {

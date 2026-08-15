@@ -1,6 +1,6 @@
 // @ts-ignore
 import * as pako from 'pako';
-import { SyncError, SyncErrorCategory, SyncTask } from './types';
+import { SyncError, SyncErrorCategory, SyncTask } from '../types';
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();

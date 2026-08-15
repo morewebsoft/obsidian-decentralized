@@ -1,5 +1,5 @@
 import { TimeoutManager } from '../utils/Timeouts';
-import { MAX_QUEUE_DEPTH } from '../../types';
+import { MAX_QUEUE_DEPTH } from '../types';
 
 export interface QueueItem {
     id?: string;

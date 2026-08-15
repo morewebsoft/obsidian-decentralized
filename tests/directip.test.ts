@@ -9,7 +9,7 @@ Object.defineProperty(global, 'window', {
     writable: true
 });
 
-import { DirectIpServer, DirectIpClient } from './directip';
+import { DirectIpServer, DirectIpClient } from '../src/directip';
 
 // Pull the mock class out of the mocked module rather than importing __mocks__/ws directly.
 // Loading that file as its own module as well as through jest.mock('ws') registers it twice,

@@ -3,6 +3,7 @@ import { nodeResolve } from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
 import terser from '@rollup/plugin-terser';
 import { createRequire } from 'node:module';
+import { copyFileSync, mkdirSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
 
@@ -62,10 +63,24 @@ const assertNoEagerNodeRequires = {
   },
 };
 
+/**
+ * Obsidian loads a plugin from a folder holding main.js + manifest.json + styles.css, so dist/
+ * is made directly installable rather than leaving the two static files behind at the repo root.
+ */
+const copyPluginAssets = {
+  name: 'copy-plugin-assets',
+  writeBundle() {
+    mkdirSync('dist', { recursive: true });
+    for (const file of ['manifest.json', 'styles.css']) {
+      copyFileSync(file, `dist/${file}`);
+    }
+  },
+};
+
 export default {
-  input: 'main.ts',
+  input: 'src/main.ts',
   output: {
-    file: 'main.js',
+    file: 'dist/main.js',
     // Obsidian's community-plugin installer only fetches main.js/manifest.json/
     // styles.css, so the plugin must be a single self-contained file. Dynamic
     // imports are inlined and merely deferred in evaluation, never split out.
@@ -114,6 +129,7 @@ export default {
       format: { comments: false },
     }),
     assertNoEagerNodeRequires,
+    copyPluginAssets,
   ].filter(Boolean),
   onwarn(warning, warn) {
     if (warning.code === 'THIS_IS_UNDEFINED') {

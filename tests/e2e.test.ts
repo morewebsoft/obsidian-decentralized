@@ -1,5 +1,5 @@
-import { DesktopLANDiscovery } from './discovery';
-import MockWebSocket from './__mocks__/ws';
+import { DesktopLANDiscovery } from '../src/discovery';
+import MockWebSocket from '../__mocks__/ws';
 
 
 // Mock dgram for LAN Discovery testing

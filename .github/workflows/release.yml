@@ -108,13 +108,11 @@ jobs:
             ARGS+=("--prerelease")
           fi
           
-          # Locate generated main.js (handles rollup outputting to subdirectories)
-          if [ -f "main.js" ]; then
-            MAIN_JS="main.js"
-          elif [ -f "dist/main.js" ]; then
+          # rollup builds to dist/; the root fallback only covers an older checkout.
+          if [ -f "dist/main.js" ]; then
             MAIN_JS="dist/main.js"
-          elif [ -f "build/main.js" ]; then
-            MAIN_JS="build/main.js"
+          elif [ -f "main.js" ]; then
+            MAIN_JS="main.js"
           else
             echo "Error: main.js not found! Verify your rollup.config.mjs output configuration."
             exit 1
@@ -122,7 +120,12 @@ jobs:
           
           ASSETS=("${MAIN_JS}#main.js" "manifest.json#manifest.json")
           
-          if [ -f "styles.css" ]; then ASSETS+=("styles.css#styles.css"); fi
-          if [ -f "dist/styles.css" ]; then ASSETS+=("dist/styles.css#styles.css"); fi
+          # elif, not a second if: dist/styles.css is a copy of the root one, and uploading
+          # both under the same asset name makes `gh release create` fail.
+          if [ -f "dist/styles.css" ]; then
+            ASSETS+=("dist/styles.css#styles.css")
+          elif [ -f "styles.css" ]; then
+            ASSETS+=("styles.css#styles.css")
+          fi
           
           gh release create "${ARGS[@]}" "${ASSETS[@]}"

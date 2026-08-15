@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const bundlePath = join(dirname(fileURLToPath(import.meta.url)), '..', 'main.js');
+const bundlePath = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'main.js');
 
 let code;
 try {

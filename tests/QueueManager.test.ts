@@ -1,5 +1,5 @@
-import { QueueManager, QueueItem } from './QueueManager';
-import { TimeoutManager } from '../utils/Timeouts';
+import { QueueManager, QueueItem } from '../src/core/QueueManager';
+import { TimeoutManager } from '../src/utils/Timeouts';
 
 describe('QueueManager', () => {
     let timeoutManager: TimeoutManager;

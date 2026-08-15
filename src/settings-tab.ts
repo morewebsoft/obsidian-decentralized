@@ -68,7 +68,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         } else {
              new Setting(containerEl)
                 .setName('Show Sync Notifications')
-                .setDesc('Show notifications for sync events. Errors and conflicts always appear. This toggle controls progress notices and network drop/reconnect chatter.')
+                .setDesc('Show notifications for sync progress. Errors and conflicts always appear. Network drop/reconnect chatter is never shown as a notification — watch the status bar for that.')
                 .addToggle(toggle => toggle
                     .setValue(this.plugin.settings.showToasts)
                     .onChange(async (value) => {
@@ -90,7 +90,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Show Sync Notifications')
-            .setDesc('Show notifications for sync events. Errors and conflicts always appear. This toggle controls progress notices and network drop/reconnect chatter.')
+            .setDesc('Show notifications for sync progress. Errors and conflicts always appear. Network drop/reconnect chatter is never shown as a notification — watch the status bar for that.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.showToasts)
                 .onChange(async (value) => {

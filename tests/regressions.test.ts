@@ -19,10 +19,10 @@ import {
     unpackTLVToFiles,
     toExactArrayBuffer,
     PackedFile,
-} from './utils';
-import { QueueManager } from './src/core/QueueManager';
-import { TimeoutManager } from './src/utils/Timeouts';
-import { SyncTask } from './types';
+} from '../src/utils';
+import { QueueManager } from '../src/core/QueueManager';
+import { TimeoutManager } from '../src/utils/Timeouts';
+import { SyncTask } from '../src/types';
 
 describe('sanitizeVaultPath', () => {
     it('accepts ordinary vault paths unchanged', () => {

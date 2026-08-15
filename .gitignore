@@ -144,3 +144,6 @@ PROJECT.md
 
 # Local tooling output
 graphify-out/
+
+# Build output (rollup writes dist/main.js + copies of manifest.json/styles.css)
+dist/

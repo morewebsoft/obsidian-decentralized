@@ -119,7 +119,7 @@ export class DirectIpServer {
             const deviceId = url.searchParams.get('deviceId') || 'unknown';
 
             if (pin !== this.pin) {
-                socket.close(1008, 'Invalid PIN');
+                socket.close(1008, 'Invalid token');
                 return;
             }
 
@@ -231,6 +231,11 @@ export class DirectIpServer {
 
     getClients(): string[] {
         return Array.from(this.clients.keys());
+    }
+
+    /** Access token shown on the hosting screen. Needed after the modal is closed and reopened. */
+    getPin(): string {
+        return this.pin;
     }
 
     sendTo(peerId: string, data: any) {
@@ -498,14 +503,14 @@ export class DirectIpClient {
             // Intentional shutdown — do nothing
             if (this.isStopped) return;
 
-            // Fatal: PIN / auth rejection → no retry, surface error
+            // Fatal: token / auth rejection → no retry, surface error
             if (event.code === 1008) {
                 this.isFatalError = true;
-                this.drainSendBuffer('Connection rejected by host (invalid PIN)');
-                this.plugin.log(`DirectIpClient: fatal close (1008 PIN/auth rejection)`);
-                this.plugin.showNotice('Connection rejected by host: invalid PIN.', 'error');
+                this.drainSendBuffer('Connection rejected by host (invalid token)');
+                this.plugin.log(`DirectIpClient: fatal close (1008 token/auth rejection)`);
+                this.plugin.showNotice('The host rejected this token. On the host, open Connect devices and copy a fresh token.', 'error');
                 this.plugin.updateStatus({
-                    text: 'Host rejected PIN',
+                    text: 'Host rejected the token — copy a fresh one from the host Connect screen',
                     icon: 'shield-off',
                     state: 'error',
                 });

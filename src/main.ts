@@ -100,6 +100,10 @@ import {
 } from './utils';
 
 import { TimeoutManager } from './utils/Timeouts';
+import { persistablePeerInfo } from './utils/pairing';
+import { isGenericDeviceName, suggestedDeviceName } from './utils/device-name';
+import { collectLocalIpv4, preferLocalIpv4, type LocalIpv4 } from './utils/net';
+import { peerErrorUserMessage, shouldTearDownPeer } from './utils/peer-error';
 import { QueueManager } from './core/QueueManager';
 import { ConnectionManager } from './core/ConnectionManager';
 
@@ -168,7 +172,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private statusBar: HTMLElement;
     // Persistent status-bar elements plus the last rendered state, so updateStatus can
     // diff instead of rebuilding the DOM on every call.
-    private statusContainerEl: HTMLElement | null = null;
     private statusIconEl: HTMLElement | null = null;
     private statusTextEl: HTMLElement | null = null;
     private lastRenderedStatus: SyncStatusState | null = null;
@@ -193,9 +196,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public async beginPairingWindow(): Promise<string> {
         if (!this.activePsk) this.activePsk = await this.generatePSK();
         this.activePskExpiresAt = Date.now() + ObsidianDecentralizedPlugin.PAIRING_WINDOW_MS;
+        if (this.pairingWindowTimer) window.clearTimeout(this.pairingWindowTimer);
+        // Re-announce so nearby devices pick up the key, then strip it when the window ends.
+        this.refreshLanBeacon();
+        this.pairingWindowTimer = window.setTimeout(() => {
+            this.pairingWindowTimer = null;
+            this.refreshLanBeacon();
+        }, ObsidianDecentralizedPlugin.PAIRING_WINDOW_MS);
         return this.activePsk;
     }
     public activePsk: string | null = null;
+    private pairingWindowTimer: number | null = null;
+
+    private refreshLanBeacon() {
+        if (Platform.isMobile) return;
+        this.lanDiscovery?.startBroadcasting(this.getMyPeerInfo());
+    }
     private clusterConnectionInterval: number | null = null;
     public pendingConnections: Set<string> = new Set();
     private pendingFileChunks: Map<string, {
@@ -331,10 +347,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.addSettingTab(new ObsidianDecentralizedSettingTab(this.app, this));
         this.conflictCenter = new ConflictCenter(this.app, this);
         this.conflictCenter.registerRibbon();
-        this.addRibbonIcon('users', 'Connect to a Peer', () => new ConnectionModal(this.app, this).open());
-        this.addRibbonIcon('refresh-cw', 'Force Full Sync with Peer', () => {
-            if (this.connections.size === 0) { this.showNotice("No peers connected.", 'important'); return; }
-            new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
+        this.app.workspace.onLayoutReady(() => this.conflictCenter.scanVault());
+        this.addRibbonIcon('users', 'Connect devices', () => new ConnectionModal(this.app, this).open());
+        this.addRibbonIcon('refresh-cw', 'Force full sync', () => {
+            if (this.connections.size === 0) {
+                new ConnectionModal(this.app, this).open();
+                return;
+            }
+            new SelectPeerModal(this.app, this, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
         });
 
         // Mirror the ribbon actions as commands. Without these nothing the plugin does can be
@@ -347,12 +367,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.addCommand({
             id: 'force-full-sync',
             name: 'Force full sync with a device',
-            checkCallback: (checking: boolean) => {
-                if (this.connections.size === 0) return false;
-                if (!checking) {
-                    new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
+            callback: () => {
+                if (this.connections.size === 0) {
+                    new ConnectionModal(this.app, this).open();
+                    return;
                 }
-                return true;
+                new SelectPeerModal(this.app, this, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
             },
         });
         this.addCommand({
@@ -663,7 +683,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!state) {
             console.warn('Primary state.json failed — attempting backup recovery...');
             state = await this.readJson(this.statePath + '.bak');
-            if (state) this.showNotice('Recovered sync state from backup (state.json.bak).', 'warning');
+            if (state) this.showNotice('We restored sync info from a backup file.', 'warning');
         }
 
         if (state) {
@@ -777,13 +797,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this._cachedExcludedFolders = null;
         this._cachedIncludedFolders = null;
         if (!this.settings.deviceId) {
-            this.settings.deviceId = `device-${Array.from(window.crypto.getRandomValues(new Uint8Array(4))).map(b => b.toString(16).padStart(2, '0')).join('')}`;
+            this.settings.deviceId = this.mintDeviceId();
+            if (isGenericDeviceName(this.settings.friendlyName)) {
+                this.settings.friendlyName = this.suggestFriendlyName();
+            }
             await this.saveData(this.settings);
         }
         if (!this.settings.peerKeys) this.settings.peerKeys = {};
+        if (!Array.isArray(this.settings.blockedPeers)) this.settings.blockedPeers = [];
         this.applyHideNativeSync(); 
         if (this.settings.knownPeers) {
-            this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, p));
+            this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, persistablePeerInfo(p)));
         }
     }
     async saveSettings() {
@@ -795,7 +819,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // stale key is never reused for a peer.
         this.invalidateCryptoKey();
     }
-    async saveKnownPeers() { this.settings.knownPeers = Array.from(this.clusterPeers.values()); await this.saveSettings(); }
+    async saveKnownPeers() {
+        this.settings.knownPeers = Array.from(this.clusterPeers.values()).map(persistablePeerInfo);
+        await this.saveSettings();
+    }
 
     /**
      * Kept for the settings tab. Per-path debouncers read settings.debounceDelay when
@@ -927,7 +954,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.isTwoDeviceMode() && this.remoteLocks.has(file.path)) {
             const lock = this.remoteLocks.get(file.path)!;
             if (Date.now() < lock.expiresAt) {
-                this.showNotice(`File ${file.name} is locked by peer. Sync delayed.`, 'warning');
+                this.showNotice(`${file.name} is being edited on another device. Sync will wait.`, 'warning');
                 // Actually delay: re-run this event once the peer's lock expires
                 this.timeoutManager.setTimeout(() => this.handleEvent(file), (lock.expiresAt - Date.now()) + 250);
                 return;
@@ -1360,10 +1387,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.pendingSyncAcks.clear();
         
         if (error) {
-            this.showNotice(`Sync failed: ${error.message}\nAction: ${error.suggestedAction}`, 'error', 10000);
+            if (error.category === SyncErrorCategory.TIMEOUT_ERROR && error.message === "Sync idle timeout reached. Connection may have dropped.") {
+                this.showNotice("Sync stalled — nothing moved for a while. Try Force full sync.", "warning");
+            } else {
+                this.showNotice(`Sync stopped. ${error.message} ${error.suggestedAction}`, 'error', 10000);
+            }
             this.log(`Sync aborted [${error.category}]: ${error.message}`);
         } else {
-            this.showNotice(`Sync aborted.`, 'warning', 5000);
+            this.showNotice(`Sync stopped.`, 'warning', 5000);
             this.log(`Sync aborted manually.`);
         }
         
@@ -1806,7 +1837,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (item && item.retries >= 3) {
                 const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : (item.task.taskType === 'send-file-batch' ? item.task.paths[0] : item.task.path)) : undefined;
                 const path = item.data?.path || taskPath || 'an item';
-                this.showNotice(`File transfer failed permanently for ${path}.`, 'error', 8000);
+                this.showNotice(`Could not transfer ${path}. Check the connection and try again.`, 'error', 8000);
                 if (this.syncState.isSyncing) this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, "Transfer failed permanently.", false, "Check peer connection."));
                 
                 if (item.data && (item.data.type === 'file-update' || item.data.type === 'file-delete' || item.data.type === 'file-delta')) {
@@ -2034,18 +2065,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private handlePeerError(err: any) {
         console.error("PeerJS Error:", err);
-        
-        if (err.type === 'peer-unavailable') {
-            this.log("A requested peer is currently offline or unavailable.");
-            return;
-        }
 
-        // A flaky network produces socket-error/webrtc errors constantly. Tearing every live
-        // connection down over one of them turns a blip into a full reconnect cycle, so only
-        // errors that actually invalidate the peer object get the full teardown.
-        const isFatal = err.type !== 'socket-error' && err.type !== 'webrtc';
-        if (!isFatal) {
-            this.log(`Transient PeerJS error (${err.type}); keeping existing connections.`);
+        if (!shouldTearDownPeer(err || {}, this.connections.size)) {
+            this.log(`PeerJS error (${err?.type || err?.message || 'unknown'}) — keeping ${this.connections.size} live link(s).`);
+            // Signaling dropped but WebRTC may still be up. Rejoin the server without
+            // destroying existing DataConnections (that is what flipped status to Sync Offline).
+            if ((err?.type === 'network' || err?.type === 'disconnected')
+                && this.peer && !this.peer.destroyed && this.peer.disconnected) {
+                this.peer.reconnect();
+            }
             return;
         }
 
@@ -2055,14 +2083,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.connections.clear();
         this.activeTransfers.clear();
 
-        let userMessage = 'Connection Failed';
-        switch(err.type) {
-            case 'network': userMessage = 'Network Error. Check internet connection.'; break;
-            case 'server-error': userMessage = 'Server Error. Try again later.'; break;
-            case 'disconnected': userMessage = 'Disconnected from server.'; break;
-            case 'unavailable-id': userMessage = 'This device ID is already in use. If you just reloaded the plugin, wait a moment; if you cloned a vault, generate a new device ID in settings.'; break;
+        this.updateStatus({ text: peerErrorUserMessage(err), icon: 'alert-triangle', state: 'error' });
+
+        // The old copy told people to generate an ID in settings, but no such control
+        // existed — a copied vault retried forever with no way out.
+        if (err?.type === 'unavailable-id' && this.peerInitAttempts === 0) {
+            this.showNotice('This device ID is already in use — usually because this vault was copied from another computer. Open Settings and tap New ID on this device, then pair again.', 'warning', 12000);
         }
-        this.updateStatus({ text: `Error: ${userMessage}`, icon: 'alert-triangle', state: 'error' });
     
         this.peerInitAttempts++;
         const backoff = Math.min(30000, this.peerInitAttempts * 2000);
@@ -2171,7 +2198,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // encrypted), so name the cause instead of silently dropping every message.
         if (raw && raw.type === 'encrypted') {
             this.showNotice(
-                'A peer is running an older, incompatible version of Obsidian Decentralized. Update it to sync.',
+                'Update Obsidian Decentralized on the other device to the same version.',
                 'error', 10000
             );
             conn.close();
@@ -2194,6 +2221,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.invalidateCryptoKey(conn.peer);
                 try {
                     data = await this.decryptPayload(raw, conn.peer);
+                    this.unblockPeer(conn.peer);
                     await this.saveSettings();
                     this.log(`Successfully authenticated new peer ${conn.peer} via active PSK`);
                 } catch(e) {
@@ -2461,14 +2489,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         const start = this.manualPingStart.get(conn!.peer)!;
                         const rtt = Date.now() - start;
                         this.manualPingStart.delete(conn!.peer);
-                        this.showNotice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`, 'important');
+                        this.showNotice(`${this.clusterPeers.get(conn!.peer)?.friendlyName || 'The other device'} replied in ${rtt} ms`, 'important');
                     }
                     break;
                 case 'sync-ping': conn?.send({ type: 'sync-pong' }); this.resetIdleTimeout(); break;
                 case 'sync-pong': this.syncState.missedPings = 0; this.resetIdleTimeout(); break;
                     
                 case 'cluster-forget': this.handleClusterForget(data); break;
-                case 'cluster-kick': this.handleClusterKick(data); break;
+                case 'cluster-kick': this.handleClusterKick(data, conn!); break;
                 case 'cluster-rename': this.handleClusterRename(data); break;
                 
                 // Locking
@@ -2500,7 +2528,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // half-applied sync at worst.
         if ((data.protocolVersion || 0) !== PROTOCOL_VERSION) {
             this.showNotice(
-                `${data.peerInfo?.friendlyName || 'A peer'} is running an incompatible version of Obsidian Decentralized. Update both devices to v3.`,
+                'Update Obsidian Decentralized on the other device to the same version.',
                 'error', 12000
             );
             this.log(`Rejecting handshake from ${conn.peer}: protocol v${data.protocolVersion || 'unknown'} (expected v${PROTOCOL_VERSION})`);
@@ -2511,6 +2539,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // open pairing window, may connect. Off by default because it locks out devices that
         // were paired by bare device ID. (This replaces a PIN gate that could never fire:
         // joinPin was only ever null, so both of its branches were unreachable.)
+        if (this.isBlocked(conn.peer)) {
+            this.log(`Ignoring handshake from removed device ${conn.peer}`);
+            conn.close();
+            return;
+        }
         if (this.settings.strictSecurity
             && !this.settings.peerKeys[conn.peer]
             && !this.getActivePsk()) {
@@ -2524,7 +2557,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'important', 4000);
         this.lastHeard.set(conn.peer, Date.now());
-        this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
+        this.connections.set(conn.peer, conn);
+        this.clusterPeers.set(conn.peer, persistablePeerInfo(data.peerInfo));
+        this.updateStatus();
         this.saveKnownPeers();
         const existingPeers = Array.from(this.clusterPeers.values());
         
@@ -2533,8 +2568,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.sendData(conn.peer, { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: data.pin, isResponse: true, protocolVersion: PROTOCOL_VERSION } as any);
             }
         } else {
-            this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers });
-            this.broadcastData({ type: 'cluster-gossip', peers: [this.getMyPeerInfo(), data.peerInfo] });
+            this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers.map(persistablePeerInfo) });
+            this.broadcastData({ type: 'cluster-gossip', peers: [persistablePeerInfo(this.getMyPeerInfo()), persistablePeerInfo(data.peerInfo)] });
         }
         
         if (this.isTwoDeviceMode()) {
@@ -2557,8 +2592,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let hasNew = false;
         data.peers.forEach(peerInfo => {
             if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) return;
+            if (this.isBlocked(peerInfo.deviceId)) return;
             if (!this.clusterPeers.has(peerInfo.deviceId)) {
-                this.clusterPeers.set(peerInfo.deviceId, peerInfo);
+                this.clusterPeers.set(peerInfo.deviceId, persistablePeerInfo(peerInfo));
                 hasNew = true;
             }
         });
@@ -2570,8 +2606,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async handleCompanionPair(data: CompanionPairPayload) {
+        if (this.isBlocked(data.peerInfo.deviceId)) return;
         this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
-        this.showNotice(`Paired with ${data.peerInfo.friendlyName} as a primary sync partner.`, 'important', 4000);
+        this.clusterPeers.set(data.peerInfo.deviceId, persistablePeerInfo(data.peerInfo));
+        this.showNotice(`${data.peerInfo.friendlyName} is now your primary sync partner.`, 'important', 4000);
         this.tryToConnectToClusterPeers();
     }
 
@@ -2583,6 +2621,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             const connectToPeer = (peerId: string) => {
                 if (peerId === this.settings.deviceId) return;
+                if (this.isBlocked(peerId)) return;
                 if (this.connections.has(peerId) || this.pendingConnections.has(peerId)) return;
                 
                 this.log(`Attempting to connect to cluster peer ${peerId}`); 
@@ -2642,23 +2681,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     handleClusterForget(data: ClusterForgetPayload) {
+        if (data.targetDeviceId === this.settings.deviceId) return;
         this.log(`Received instruction to forget device: ${data.targetDeviceId}`);
-        this.pendingConnections.delete(data.targetDeviceId);
-        if (this.connections.has(data.targetDeviceId)) {
-            this.connections.get(data.targetDeviceId)?.close();
-        }
-        this.clusterPeers.delete(data.targetDeviceId);
-        this.saveKnownPeers();
-        this.updateStatus();
+        void this.forgetDevice(data.targetDeviceId, { broadcast: false });
     }
 
-    handleClusterKick(data: ClusterKickPayload) {
+    handleClusterKick(data: ClusterKickPayload, conn?: DataConnection) {
         if (data.targetDeviceId === this.settings.deviceId) {
-            this.showNotice("You have been kicked from the cluster.", 'error');
-        } else if (this.connections.has(data.targetDeviceId)) {
-            this.log(`Kicking device: ${data.targetDeviceId}`);
-            this.connections.get(data.targetDeviceId)?.close();
+            const name = conn
+                ? (this.clusterPeers.get(conn.peer)?.friendlyName || 'Another device')
+                : 'Another device';
+            this.showNotice(`${name} removed this device from the group. Open Connect devices to pair again.`, 'warning', 10000);
+            void this.leaveCluster();
+            return;
         }
+        void this.forgetDevice(data.targetDeviceId, { broadcast: false });
     }
 
     handleClusterRename(data: ClusterRenamePayload) {
@@ -2675,6 +2712,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
+    private mintDeviceId(): string {
+        return `device-${Array.from(window.crypto.getRandomValues(new Uint8Array(4))).map(b => b.toString(16).padStart(2, '0')).join('')}`;
+    }
+
+    /** New PeerJS identity after a vault copy collided with the original device. */
+    public async resetDeviceIdentity(): Promise<void> {
+        this.settings.deviceId = this.mintDeviceId();
+        await this.saveSettings();
+        this.reinitializeConnectionManager();
+        this.showNotice('This device has a new ID. Open Connect devices on the other side and pair again.', 'important', 8000);
+    }
+
     public async forgetCompanion() {
         const companionId = this.settings.companionPeerId;
         if (companionId) { 
@@ -2684,6 +2733,48 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         this.settings.companionPeerId = undefined; await this.saveSettings(); 
         this.showNotice('Paired Device link forgotten.', 'important', 3000);
+    }
+
+    public isBlocked(deviceId: string): boolean {
+        return !!this.settings.blockedPeers?.includes(deviceId);
+    }
+
+    /** Clear a Remove/Forget block so a new pairing can succeed. */
+    public unblockPeer(deviceId: string): boolean {
+        const list = this.settings.blockedPeers;
+        if (!list?.length) return false;
+        const next = list.filter(id => id !== deviceId);
+        if (next.length === list.length) return false;
+        this.settings.blockedPeers = next;
+        return true;
+    }
+
+    /**
+     * Drop a device from this vault's group. With broadcast (the default) every
+     * connected member forgets it too. Kick tells that device it was removed.
+     * Blocked IDs stay out of the list until the user pairs with them again —
+     * otherwise handshake/gossip put them back within seconds.
+     */
+    public async forgetDevice(deviceId: string, opts?: { broadcast?: boolean; kick?: boolean }): Promise<void> {
+        if (!deviceId || deviceId === this.settings.deviceId) return;
+        if (opts?.kick) this.broadcastData({ type: 'cluster-kick', targetDeviceId: deviceId });
+        if (opts?.broadcast !== false) this.broadcastData({ type: 'cluster-forget', targetDeviceId: deviceId });
+        this.pendingConnections.delete(deviceId);
+        this.connections.get(deviceId)?.close();
+        this.connections.delete(deviceId);
+        this.clusterPeers.delete(deviceId);
+        delete this.settings.peerKeys[deviceId];
+        this.invalidateCryptoKey(deviceId);
+        if (this.settings.companionPeerId === deviceId) this.settings.companionPeerId = undefined;
+        if (!this.settings.blockedPeers) this.settings.blockedPeers = [];
+        if (!this.settings.blockedPeers.includes(deviceId)) this.settings.blockedPeers.push(deviceId);
+        await this.saveKnownPeers();
+        this.updateStatus();
+    }
+
+    private async leaveCluster(): Promise<void> {
+        const ids = Array.from(this.clusterPeers.keys());
+        for (const id of ids) await this.forgetDevice(id, { broadcast: false });
     }
 
     private static textEncoder = new TextEncoder();
@@ -2748,7 +2839,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             clearTimeout(req.timeout);
             req.resolve(false);
             this.pendingLockRequests.delete(data.requestId);
-            this.showNotice(`Lock denied for ${data.path}: ${data.reason}`, 'warning');
+            this.showNotice(`Another device is editing ${data.path.split('/').pop() || data.path}`, 'warning');
         }
     }
 
@@ -2776,7 +2867,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // --- Editor Sync Handlers ---
     handleEditorActive(data: EditorActivatePayload, conn: DataConnection) {
         this.activeEditorLocks.set(data.path, conn.peer);
-        this.showNotice(`Peer is actively editing ${data.path}`, 'info', 3000);
+        this.showNotice(`Another device is editing ${data.path.split('/').pop() || data.path}`, 'info', 3000);
     }
 
     handleEditorDelta(data: EditorDeltaPayload) {
@@ -3305,7 +3396,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (file instanceof TFile) await this.handleFileModification(data, file);
             } else {
                 console.error("File creation error:", e);
-                this.showNotice(`Failed to create file: ${data.path}`, 'error');
+                this.showNotice(`Could not create ${data.path} on this device.`, 'error');
                 throw e;
             }
         }
@@ -3419,7 +3510,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     private async resolveConflict(data: FileUpdatePayload, existingFile: TFile, localContent: string | ArrayBuffer) {
-        this.showNotice(`Conflict detected for: ${data.path}`, 'important', 10000);
         const strategy = this.getConflictStrategy();
         this.log(`Conflict detected for: ${data.path}. Strategy: ${strategy}`);
 
@@ -3575,6 +3665,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             await this.app.vault.create(conflictPath, data.content as string);
         }
         this.conflictCenter.addConflict(data.path, conflictPath);
+        this.showNotice(`Conflict on ${data.path}. Open Conflict Center (left ribbon, or “Resolve sync conflicts”) to choose a version.`, 'important', 12000);
     }
 
     async applyFileDelete(data: FileDeletePayload) {
@@ -3617,7 +3708,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     await this.app.vault.delete(existingFile);
                 } catch (e) {
                     console.error(`Error deleting file: ${data.path}`, e);
-                    this.showNotice(`Failed to delete file: ${data.path}`, 'error');
+                    this.showNotice(`Could not delete ${data.path} on this device.`, 'error');
                 }
             }
         });
@@ -3646,7 +3737,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         await this.app.vault.rename(fileToRename, data.newPath); 
                     } catch (e) { 
                         console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); 
-                        this.showNotice(`Failed to rename file: ${data.oldPath}`, 'error'); 
+                        this.showNotice(`Could not rename ${data.oldPath} on this device.`, 'error'); 
                     } 
                 } else {
                     const newFile = this.app.vault.getAbstractFileByPath(data.newPath);
@@ -3752,7 +3843,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async handleMerkleRoot(data: MerkleRootPayload, conn: DataConnection) {
         // Merkle reconciliation runs as BACKGROUND convergence over the normal queue —
         // it must not claim the full-sync state machine: the traversal has no completion
-        // signal, so claiming isSyncing here left the plugin stuck in "Requesting Sync..."
+        // signal, so claiming isSyncing here left the plugin stuck in "Starting sync..."
         // until the phase timeout aborted with an error.
         if (this.syncState.isSyncing) return;
         const tree = await this.getMerkleTree();
@@ -3998,7 +4089,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             
             if (peerPotentiallyStale) {
-                this.showNotice("Warning: Peer has files older than your tombstone retention period. This might resurrect deleted files.", 'warning', 15000);
+                this.showNotice("The other device has been offline longer than this vault remembers deletions. Files you deleted here might reappear from that device.", 'warning', 15000);
             }
             
             this.log(`Sync plan: They pull ${filesReceiverWillSend.length}, I pull ${filesInitiatorMustSend.length}, They delete ${filesInitiatorMustDelete.length}, I delete ${filesReceiverMustDelete.length}`); 
@@ -4534,24 +4625,67 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         return candidate;
     }
-    getLocalIp(): string | null { if (Platform.isMobile) return null; try { const os = require('os'); const interfaces = os.networkInterfaces(); for (const name in interfaces) { for (const net of interfaces[name]!) { if (net.family === 'IPv4' && !net.internal) return net.address; } } } catch (e) { console.warn("Could not get local IP address.", e); } return null; }
+    getLocalIps(): LocalIpv4[] {
+        if (Platform.isMobile) return [];
+        try {
+            const os = require('os');
+            return collectLocalIpv4(os.networkInterfaces() || {});
+        } catch (e) {
+            console.warn("Could not get local IP address.", e);
+            return [];
+        }
+    }
+    getLocalIp(): string | null {
+        return preferLocalIpv4(this.getLocalIps());
+    }
     getMyPeerInfo(): PeerInfo {
         const mode = this.getConnectionMode();
         let port: number | undefined;
         if (mode === 'direct-ip' && this.directIpServer) {
             port = this.settings.directIpHostPort;
         }
+        const pairingKey = this.getActivePsk() || undefined;
         return { 
             deviceId: this.peer?.id || this.settings.deviceId, 
             friendlyName: this.settings.friendlyName, 
             ip: this.getLocalIp(),
             mode: mode,
-            port: port
+            port: port,
+            pairingKey,
         }; 
     }
+
+    public suggestFriendlyName(): string {
+        let hostname: string | null = null;
+        if (!Platform.isMobile) {
+            try {
+                const os = require('os');
+                hostname = typeof os.hostname === 'function' ? String(os.hostname() || '') : null;
+            } catch {
+                hostname = null;
+            }
+        }
+        return suggestedDeviceName(Platform.isMobile, hostname);
+    }
+
+    public async setFriendlyName(name: string): Promise<boolean> {
+        const trimmed = name.trim();
+        if (!trimmed || trimmed.length > 64) return false;
+        if (trimmed === this.settings.friendlyName) return true;
+        this.settings.friendlyName = trimmed;
+        await this.saveSettings();
+        this.broadcastData({ type: 'cluster-rename', targetDeviceId: this.settings.deviceId, newName: trimmed });
+        this.refreshLanBeacon();
+        this.updateStatus();
+        return true;
+    }
+
     /** Starts the offline host. Resolves with the access token, or null if it could not bind. */
     public async startDirectIpHost(): Promise<string | null> {
         if (Platform.isMobile) return null;
+        // Re-opening Connect after Start Hosting used to call this again, which tore
+        // down the live server and minted a new token the other device no longer had.
+        if (this.directIpServer) return this.directIpServer.getPin();
         this.reinitializeConnectionManager();
         const pin = Array.from(window.crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join('');
         const server = new DirectIpServer(this, this.settings.directIpHostPort, pin);
@@ -4588,20 +4722,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // Initiate handshake
         await this.directIpClient.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: config.pin, protocolVersion: PROTOCOL_VERSION });
     }
-    
+
+    /** True when Sync Progress has something to show (not merely "Connecting…"). */
+    public hasVisibleSyncWork(): boolean {
+        return this.syncState.isSyncing
+            || this.activeTransfers.size > 0
+            || this.failedSyncs.length > 0
+            || this.queueManager.getQueueSize() > 0
+            || this.queueManager.getActiveTransfers() > 0;
+    }
 
     public calculateStatus(): SyncStatusState {
         if (this.syncState.isSyncing) {
             let text = "Syncing...";
-            if (this.syncState.currentPhase === SyncPhase.REQUESTING) text = "Requesting Sync...";
-            else if (this.syncState.currentPhase === SyncPhase.PLANNING) text = "Comparing Vaults...";
+            if (this.syncState.currentPhase === SyncPhase.REQUESTING) text = "Starting sync...";
+            else if (this.syncState.currentPhase === SyncPhase.PLANNING) text = "Looking for changes...";
             else if (this.syncState.currentPhase === SyncPhase.TRANSFERRING) text = `Syncing (${this.syncState.filesTransferred}/${this.syncState.filesTotal})...`;
-            else if (this.syncState.currentPhase === SyncPhase.COMPLETING) text = "Completing Sync...";
+            else if (this.syncState.currentPhase === SyncPhase.COMPLETING) text = "Finishing sync...";
             return { text, icon: "refresh-cw", spin: true, state: 'loading' };
         }
         if (this.activeTransfers.size > 0) {
             const count = Array.from(this.activeTransfers.values()).filter(t => t.status === 'active').length;
-            if (count === 0 && this.activeTransfers.size > 0) return { text: "Transfers Paused", icon: "pause-circle", state: 'neutral' };
+            if (count === 0 && this.activeTransfers.size > 0) return { text: "Sync paused", icon: "pause-circle", state: 'neutral' };
             return { text: `Syncing ${count} file${count > 1 ? 's' : ''}...`, icon: "arrow-up-down", spin: false, state: 'loading' };
         }
         if (this.queueManager.getActiveTransfers() > 0 || this.queueManager.getQueueSize() > 0) {
@@ -4624,7 +4766,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const client = this.directIpClient;
                 // Fatal error (e.g. PIN rejection) — non-recoverable
                 if (client.isFatalError) {
-                    return { text: 'Host Rejected PIN', icon: 'shield-off', state: 'error' };
+                    return { text: 'Host rejected the token', icon: 'shield-off', state: 'error' };
                 }
                 // Backoff-reconnect in progress
                 if (!client.isOpen) {
@@ -4632,20 +4774,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
                 // Socket open but liveness not yet confirmed (waiting for first message)
                 if (!client.isLive) {
-                    return { text: 'Verifying link…', icon: 'plug', spin: true, state: 'loading' };
+                    return { text: 'Checking connection…', icon: 'plug', spin: true, state: 'loading' };
                 }
                 // Confirmed live connection
-                return { text: isAuto ? 'Connected Offline' : 'Client Mode', icon: 'smartphone', state: 'success' };
+                return { text: isAuto ? 'Connected in Offline Mode' : 'Connected to offline host', icon: 'smartphone', state: 'success' };
             }
             return { text: "Offline Mode", icon: "network", state: 'neutral' };
         }
-        if (!this.peer || this.peer.disconnected) return { text: "Sync Offline", icon: "wifi-off", state: 'error' };
+        // Not Offline Mode — that is the LAN-only connection. This is the signaling
+        // server being unreachable; "Sync Offline" made people think they were already
+        // in Offline Mode, or that they should switch to it.
+        if (!this.peer || this.peer.disconnected) return { text: "Can't reach the sync network", icon: "wifi-off", state: 'error' };
         if (!this.peer.id) return { text: "Connecting...", icon: "plug", spin: true, state: 'loading' };
         if (this.connections.size > 0) {
-            if (this.isTwoDeviceMode()) return { text: "Paired Sync Active", icon: "link", state: 'success' };
-            return { text: `Connected (${this.connections.size})`, icon: "users", state: 'success' };
+            if (this.isTwoDeviceMode()) {
+                const other = this.clusterPeers.get(Array.from(this.connections.keys())[0]);
+                return { text: other ? `Synced with ${other.friendlyName}` : 'Synced', icon: "link", state: 'success' };
+            }
+            return { text: `Connected to ${this.connections.size} device${this.connections.size > 1 ? 's' : ''}`, icon: "users", state: 'success' };
         }
-        return { text: "Online", icon: "globe", state: 'neutral' };
+        return { text: "No devices connected", icon: "globe", state: 'neutral' };
     }
 
     private static readonly STATUS_COLORS: Record<SyncStatusState['state'], string> = {
@@ -4675,9 +4823,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.statusBar.empty();
             const container = this.statusBar.createDiv({ cls: 'od-status-container' });
             container.onclick = () => {
-                if (this.lastRenderedStatus?.state === 'loading') new SyncProgressModal(this.app, this).open();
+                // 'loading' also covers Connecting / Reconnecting / Checking connection, which
+                // used to open an empty Sync Progress modal. Only open it when the modal
+                // actually has transfers, a full sync, or failed retries to show.
+                if (this.hasVisibleSyncWork()) new SyncProgressModal(this.app, this).open();
+                else new ConnectionModal(this.app, this).open();
             };
-            this.statusContainerEl = container;
+            container.addClass('mod-clickable');
             this.statusIconEl = container.createDiv({ cls: 'od-status-icon' });
             this.statusTextEl = container.createSpan();
             this.lastRenderedStatus = null;
@@ -4698,7 +4850,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         if (!prev || prev.state !== status.state) {
             this.statusIconEl.style.color = ObsidianDecentralizedPlugin.STATUS_COLORS[status.state];
-            this.statusContainerEl?.toggleClass('mod-clickable', status.state === 'loading');
         }
         if (!prev || prev.text !== status.text) {
             this.statusTextEl.setText(status.text);

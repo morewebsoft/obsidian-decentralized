@@ -1,10 +1,13 @@
 import { App, Modal, Platform, Setting, TFile, Notice, setIcon } from 'obsidian';
-import { DataConnection } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
 import type * as QRCodeType from 'qrcode';
 import type { Html5Qrcode as Html5QrcodeType } from 'html5-qrcode';
 import type ObsidianDecentralizedPlugin from './main';
 import { PeerInfo, describeSyncPhase } from './types';
+import { originalPathFromConflictCopy } from './utils';
+import { buildPairingPayload, parsePairingInput, persistablePeerInfo } from './utils/pairing';
+import { isGenericDeviceName } from './utils/device-name';
+import type { LocalIpv4 } from './utils/net';
 
 // The QR generator and scanner together account for over half the bundle, yet they
 // are only reachable from the pairing modal. Importing them dynamically keeps their
@@ -20,6 +23,30 @@ let html5QrcodeCtor: typeof Html5QrcodeType | null = null;
 async function loadHtml5Qrcode(): Promise<typeof Html5QrcodeType> {
     if (!html5QrcodeCtor) html5QrcodeCtor = (await import('html5-qrcode')).Html5Qrcode;
     return html5QrcodeCtor;
+}
+
+/** Offline host: show every local IPv4 so a Hyper-V/VPN adapter is not the only choice. */
+export function renderHostAddresses(parent: HTMLElement, addrs: LocalIpv4[], port: number) {
+    if (addrs.length === 0) {
+        parent.createDiv({
+            text: 'No network address found — check that you are connected to Wi-Fi or Ethernet.',
+            cls: 'mod-warning'
+        });
+        return;
+    }
+    const preferred = addrs[0];
+    parent.createDiv({
+        text: addrs.length > 1 ? `IP: ${preferred.address} (try this first)` : `IP: ${preferred.address}`,
+        cls: 'od-ip-display'
+    });
+    parent.createDiv({ text: `Port: ${port}`, cls: 'od-text-muted' });
+    if (addrs.length > 1) {
+        const extras = addrs.slice(1).map(a => a.address).join(', ');
+        parent.createDiv({
+            text: `Also on this computer: ${extras}. If the other device cannot reach the host, try one of those — pick the address that looks like your Wi-Fi (usually 192.168…).`,
+            cls: 'od-instruction-text'
+        });
+    }
 }
 
 export function formatBytes(bytes: number, decimals = 2) {
@@ -38,45 +65,74 @@ export class ConnectionModal extends Modal {
     
     private activeTab: 'quick-pair' | 'advanced' = 'quick-pair';
     private statusState: 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'error' = 'idle';
-    private statusMessage: string = 'Not connected';
+    private statusMessage: string = 'Ready to pair';
     private activePsk: string | null = null;
+    private lastPairedId: string | null = null;
+    private lastPairedName: string | null = null;
+    private pairingRefreshTimer: number | null = null;
+    private pairingValidityTimer: number | null = null;
+    private handshakeTimer: number | null = null;
+    private connectTimeout: number | null = null;
 
     constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
 
     async onOpen() {
         this.contentEl.addClass(Platform.isMobile ? 'od-mobile' : 'od-desktop');
+
+        // Offline Mode has no PeerJS pairing code. Opening on Quick Pair hid the IP/token
+        // and offered a flow that cannot work ("wait until the status bar no longer says
+        // Offline" while the bar reads "Offline Mode").
+        if (this.plugin.getConnectionMode() === 'direct-ip') {
+            this.activeTab = 'advanced';
+        }
         
-        if (this.plugin.connections && this.plugin.connections.size > 0) {
+        if (this.plugin.getConnectionMode() === 'direct-ip' && this.plugin.directIpServer) {
+            const n = this.plugin.directIpServer.getClients().length;
+            this.statusState = 'connected';
+            this.statusMessage = n > 0
+                ? `Hosting — ${n} device${n === 1 ? '' : 's'} connected`
+                : 'Hosting — waiting for devices';
+        } else if (this.plugin.connections && this.plugin.connections.size > 0) {
             // Direct IP: reflect liveness/reconnect state precisely
             const client = this.plugin.directIpClient;
             if (client) {
                 if (client.isFatalError) {
                     this.statusState = 'error';
-                    this.statusMessage = 'Host rejected PIN — cannot reconnect.';
+                    this.statusMessage = 'Host rejected the token — copy a fresh one from the host Connect screen.';
                 } else if (!client.isOpen) {
                     this.statusState = 'reconnecting';
-                    this.statusMessage = 'Reconnecting to Offline Host…';
+                    this.statusMessage = 'Reconnecting to the offline host…';
                 } else if (!client.isLive) {
                     this.statusState = 'connecting';
-                    this.statusMessage = 'Verifying link to Offline Host…';
+                    this.statusMessage = 'Verifying the link to the offline host…';
                 } else {
                     this.statusState = 'connected';
-                    this.statusMessage = `Connected to ${this.plugin.connections.size} device(s)`;
+                    this.statusMessage = `Connected to ${this.plugin.connections.size} device${this.plugin.connections.size === 1 ? '' : 's'}`;
                 }
             } else {
                 this.statusState = 'connected';
-                this.statusMessage = `Connected to ${this.plugin.connections.size} device(s)`;
+                this.statusMessage = `Connected to ${this.plugin.connections.size} device${this.plugin.connections.size === 1 ? '' : 's'}`;
             }
         }
         
         // Opening this modal is what puts the device into pairing mode, so (re)start the
         // window here rather than leaving auto-enrolment armed for the whole session.
         this.activePsk = await this.plugin.beginPairingWindow();
+        this.pairingRefreshTimer = window.setInterval(async () => {
+            if (!this.plugin.getActivePsk()) {
+                this.activePsk = await this.plugin.beginPairingWindow();
+                if (this.statusState === 'idle') this.render();
+            }
+        }, 30000);
         
         this.render();
     }
 
     onClose() {
+        if (this.pairingRefreshTimer) window.clearInterval(this.pairingRefreshTimer);
+        if (this.pairingValidityTimer) window.clearInterval(this.pairingValidityTimer);
+        if (this.handshakeTimer) window.clearTimeout(this.handshakeTimer);
+        if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
         if (this.plugin.lanDiscovery) {
             if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
             if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
@@ -85,31 +141,6 @@ export class ConnectionModal extends Modal {
             // the LAN until the plugin was reloaded.
         }
         this.contentEl.empty();
-    }
-
-
-    formatPairingCodeForDisplay(deviceId: string): string {
-        if (deviceId.startsWith('device-')) {
-            const hex = deviceId.substring(7);
-            if (hex.length >= 8) {
-                const mid = Math.floor(hex.length / 2);
-                return `device-${hex.substring(0, mid)}-${hex.substring(mid)}`;
-            }
-        }
-        return deviceId;
-    }
-
-    normalizePairingCodeInput(input: string): string {
-        let cleaned = input.trim().replace(/\s+/g, '');
-        if (cleaned.startsWith('device-')) {
-            const hexPart = cleaned.substring(7).replace(/-/g, '');
-            return `device-${hexPart}`;
-        }
-        const justHex = cleaned.replace(/-/g, '');
-        if (justHex.length === 8 && /^[0-9a-fA-F]{8}$/.test(justHex)) {
-            return `device-${justHex.toLowerCase()}`;
-        }
-        return cleaned;
     }
 
     render() {
@@ -144,6 +175,9 @@ export class ConnectionModal extends Modal {
             // Only shown for non-recoverable failures (e.g. PIN rejection)
             const alert = banner.createSpan();
             setIcon(alert, 'alert-triangle');
+        } else {
+            const ready = banner.createSpan();
+            setIcon(ready, 'radio');
         }
         
         banner.createSpan({ text: this.statusMessage });
@@ -152,49 +186,112 @@ export class ConnectionModal extends Modal {
     renderTabNavigation() {
         const tabsContainer = this.contentEl.createDiv({ cls: 'od-connection-tabs' });
         
-        const quickPairBtn = tabsContainer.createEl('button', { text: 'Quick Pair', cls: `od-tab-btn ${this.activeTab === 'quick-pair' ? 'active' : ''}` });
+        const quickPairBtn = tabsContainer.createEl('button', {
+            text: 'Quick Pair',
+            cls: `od-tab-btn ${this.activeTab === 'quick-pair' ? 'active' : ''}`,
+            attr: {
+                'aria-label': 'Quick Pair tab',
+                title: 'Pair by code, QR, or a nearby device',
+                'aria-selected': this.activeTab === 'quick-pair' ? 'true' : 'false',
+            },
+        });
         quickPairBtn.onclick = () => { this.activeTab = 'quick-pair'; this.render(); };
         
-        const advancedBtn = tabsContainer.createEl('button', { text: 'Advanced', cls: `od-tab-btn ${this.activeTab === 'advanced' ? 'active' : ''}` });
+        const advancedLabel = this.plugin.getConnectionMode() === 'direct-ip' ? 'Offline Mode' : 'Advanced';
+        const advancedBtn = tabsContainer.createEl('button', {
+            text: advancedLabel,
+            cls: `od-tab-btn ${this.activeTab === 'advanced' ? 'active' : ''}`,
+            attr: {
+                'aria-label': `${advancedLabel} tab`,
+                title: this.plugin.getConnectionMode() === 'direct-ip'
+                    ? 'Host or join on the local network'
+                    : 'Offline Mode and other options',
+                'aria-selected': this.activeTab === 'advanced' ? 'true' : 'false',
+            },
+        });
         advancedBtn.onclick = () => { this.activeTab = 'advanced'; this.render(); };
     }
 
-    async attemptConnection(scannedId: string) {
-        if (!scannedId.trim()) return;
-        
-        const parts = scannedId.split('|');
-        const peerId = this.normalizePairingCodeInput(parts[0]);
-        const psk = parts[1];
+    private fail(message: string) {
+        this.statusState = 'error';
+        this.statusMessage = message;
+        this.render();
+    }
 
-        if (psk) {
-            // Validate before storing. A malformed key used to be written straight into
-            // settings and only failed later, deep inside getCryptoKey, on every message.
-            if (!/^[A-Za-z0-9+/]{40,}={0,2}$/.test(psk)) {
-                this.statusState = 'error';
-                this.statusMessage = 'That pairing code looks damaged. Copy it again from the other device.';
-                this.render();
-                return;
+    private markPaired(peerId: string) {
+        const name = this.plugin.clusterPeers.get(peerId)?.friendlyName || peerId;
+        this.lastPairedId = peerId;
+        this.lastPairedName = name;
+        this.statusState = 'connected';
+        this.statusMessage = `Paired with ${name}`;
+        this.render();
+    }
+
+    private waitForHandshake(peerId: string): Promise<boolean> {
+        return new Promise(resolve => {
+            const started = Date.now();
+            const tick = () => {
+                if (this.plugin.connections.has(peerId)) {
+                    resolve(true);
+                    return;
+                }
+                if (Date.now() - started > 15000) {
+                    resolve(false);
+                    return;
+                }
+                this.handshakeTimer = window.setTimeout(tick, 200);
+            };
+            tick();
+        });
+    }
+
+    async attemptConnection(raw: string, source: 'paste' | 'scan' | 'nearby' = 'paste') {
+        const parsed = parsePairingInput(raw);
+        if (parsed.kind === 'empty') return;
+
+        if (parsed.kind === 'invalid') {
+            this.fail(parsed.reason);
+            return;
+        }
+
+        if (parsed.kind === 'device-id') {
+            if (source === 'nearby') {
+                this.fail('Open Connect devices on that device first, then tap it again. Nearby pairing needs both sides on this screen.');
+            } else {
+                this.fail('That is only a device ID, not the pairing code. On the other device press Copy, then paste the whole code here.');
             }
-            this.plugin.settings.peerKeys[peerId] = psk;
-            await this.plugin.saveSettings();
-        } else {
-            this.plugin.showNotice(
-                'Connecting without an encryption key — this device ID was entered on its own. Use the full copied code or the QR to encrypt the link.',
-                'warning'
-            );
+            return;
+        }
+
+        if (this.plugin.getConnectionMode() === 'direct-ip') {
+            this.fail('This vault is in Offline Mode. Open the Offline Mode tab to host or join with an IP and token.');
+            return;
+        }
+
+        const { deviceId: peerId, psk } = parsed;
+        if (peerId === this.plugin.settings.deviceId || peerId === this.plugin.peer?.id) {
+            this.fail('That is this device\'s own code. Paste the code from the other device.');
+            return;
+        }
+
+        this.plugin.settings.peerKeys[peerId] = psk;
+        this.plugin.unblockPeer(peerId);
+        await this.plugin.saveSettings();
+
+        if (!this.plugin.peer || this.plugin.peer.disconnected || !this.plugin.peer.id) {
+            this.fail('This device cannot reach the sync network yet. Wait until the status bar changes, then try again. If you have no internet, use the Offline Mode tab instead.');
+            return;
         }
 
         this.statusState = 'connecting';
-        this.statusMessage = `Connecting to ${peerId}...`;
+        this.statusMessage = 'Connecting… keep Connect devices open on both sides.';
         this.render();
 
         // reliable:true is required — an unordered channel lets file-chunk-data
         // overtake file-chunk-start, permanently breaking large-file transfers.
-        const conn = this.plugin.peer?.connect(peerId, { reliable: true });
+        const conn = this.plugin.peer.connect(peerId, { reliable: true });
         if (!conn) {
-            this.statusState = 'error';
-            this.statusMessage = 'Failed to initiate connection. Are you online?';
-            this.render();
+            this.fail('Could not start the connection. Check that both devices are online and try again.');
             return;
         }
 
@@ -204,147 +301,360 @@ export class ConnectionModal extends Modal {
         // sent and pairing produced a half-open one-way connection.
         this.plugin.setupConnection(conn);
 
-        // PeerJS reports "peer unavailable" on the Peer object, not this connection —
-        // without a timeout a typo'd code left the modal spinning forever.
-        const connectTimeout = window.setTimeout(() => {
+        if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
+        this.connectTimeout = window.setTimeout(() => {
             if (this.statusState === 'connecting') {
-                this.statusState = 'error';
-                this.statusMessage = 'Connection timed out. Check the code and make sure the other device is online.';
-                this.render();
+                this.fail('Timed out. Check the code, keep this screen open on both devices, and try again.');
             }
         }, 20000);
 
-        conn.on('open', () => {
-            window.clearTimeout(connectTimeout);
-            this.statusState = 'connected';
-            this.statusMessage = `Connected to ${conn.peer}`;
+        conn.on('open', async () => {
+            if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
+            this.statusState = 'connecting';
+            this.statusMessage = 'Confirming the pairing…';
             this.render();
-            setTimeout(() => this.close(), 1500);
+            const ok = await this.waitForHandshake(peerId);
+            if (ok) this.markPaired(peerId);
+            else if (this.statusState === 'connecting') {
+                this.fail('The other device did not finish pairing. Keep Connect devices open on both sides and try again.');
+            }
         });
 
-        conn.on('error', (err) => {
-            window.clearTimeout(connectTimeout);
-            this.statusState = 'error';
-            this.statusMessage = `Connection failed. Try again.`;
-            this.render();
+        conn.on('error', () => {
+            if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
+            this.fail('Connection failed. Check the code and that the other device is online.');
         });
     }
 
     renderQuickPairTab() {
         const { contentEl } = this;
-        contentEl.createEl('h2', { text: 'Quick Pair', cls: 'od-dashboard-header' });
-        contentEl.createDiv({ text: 'Connect devices easily using codes or QR', cls: 'od-dashboard-subtitle' });
+        if (this.plugin.getConnectionMode() === 'direct-ip') {
+            this.renderOfflineInsteadOfPairing(contentEl);
+            return;
+        }
+
+        contentEl.createEl('h2', { text: 'Connect devices', cls: 'od-dashboard-header' });
+        contentEl.createDiv({
+            text: 'One device shows this screen. On the other, paste the code or scan the QR.',
+            cls: 'od-dashboard-subtitle'
+        });
+
+        if (this.statusState === 'connected' && this.lastPairedId) {
+            this.renderPairSuccess(contentEl);
+            return;
+        }
+
+        this.renderDeviceNameField(contentEl);
 
         const myInfo = this.plugin.getMyPeerInfo();
         if (!myInfo || !myInfo.deviceId) {
-            contentEl.createDiv({ text: 'Error: This device does not have a valid Device ID. Please check settings.', cls: 'mod-warning' });
+            contentEl.createDiv({ text: 'This device does not have an ID yet. Wait a moment and open this screen again.', cls: 'mod-warning' });
             return;
         }
 
-        // Step 1: Share Your Code
-        contentEl.createDiv({ text: 'Step 1: Share Your Code', cls: 'od-step-header' });
-        
-        const codeContainer = contentEl.createDiv({ cls: 'od-pairing-code-container' });
-        const formattedCode = this.formatPairingCodeForDisplay(myInfo.deviceId);
-        codeContainer.createDiv({ text: formattedCode, cls: 'od-pairing-code-text' });
-        
         if (!this.activePsk) {
-            contentEl.createDiv({ text: 'Error: Encryption key (PSK) is missing. Pairing is blocked.', cls: 'mod-warning' });
-            new Notice('Pairing blocked: Encryption key (PSK) is missing or not generated.');
+            contentEl.createDiv({ text: 'Could not create a pairing key. Close this window and open it again.', cls: 'mod-warning' });
             return;
         }
-        
-        const qrPayload = `${myInfo.deviceId}|${this.activePsk}`;
-        
-        const copyBtn = codeContainer.createEl('button', { text: 'Copy' });
-        copyBtn.onclick = () => {
-            navigator.clipboard.writeText(qrPayload);
-            copyBtn.setText('Copied!');
-            setTimeout(() => copyBtn.setText('Copy'), 2000);
+
+        const qrPayload = buildPairingPayload(myInfo.deviceId, this.activePsk);
+
+        contentEl.createDiv({ text: 'Your pairing code', cls: 'od-step-header' });
+        const codeContainer = contentEl.createDiv({ cls: 'od-pairing-code-container' });
+        codeContainer.createDiv({ text: qrPayload, cls: 'od-pairing-code-text' });
+
+        const copyBtn = codeContainer.createEl('button', {
+            text: 'Copy pairing code',
+            cls: 'mod-cta',
+            attr: {
+                'aria-label': 'Copy pairing code',
+                title: 'Copy the full pairing code to the clipboard',
+            },
+        });
+        copyBtn.onclick = async () => {
+            try {
+                await navigator.clipboard.writeText(qrPayload);
+                copyBtn.setText('Copied');
+                window.setTimeout(() => copyBtn.setText('Copy pairing code'), 2000);
+            } catch {
+                const range = document.createRange();
+                range.selectNodeContents(codeContainer.querySelector('.od-pairing-code-text')!);
+                const sel = window.getSelection();
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+                new Notice('Select the code and copy it (Ctrl+C / Cmd+C).');
+            }
         };
 
-        // The code on screen is only the device ID; Copy puts the device ID *and* the
-        // encryption key on the clipboard. Say so — users were being told to share it.
         contentEl.createDiv({
-            text: 'Press Copy and paste the result on your other device. The copied code contains this vault\'s encryption key, so treat it like a password — anyone who has it can pair with you.',
+            text: 'This is the whole code — including the encryption key. Treat it like a password.',
             cls: 'od-instruction-text'
         });
-        
+        this.renderPairingValidity(contentEl);
+
         const qrSection = contentEl.createDiv({ cls: 'od-qr-section' });
-        qrSection.createDiv({ text: 'Or scan QR code (Includes Encryption Key)', cls: 'od-qr-label' });
-        
+        qrSection.createDiv({ text: 'Or scan this QR on the other device', cls: 'od-qr-label' });
+
         const imgEl = qrSection.createEl('img');
+        imgEl.setAttr('alt', 'Pairing QR code');
         loadQRCode()
-            .then(QRCode => QRCode.toDataURL(qrPayload, { width: 150, margin: 2 }))
-            .then(url => {
-                imgEl.src = url;
-            }).catch(err => {
+            .then(QRCode => QRCode.toDataURL(qrPayload, { width: 180, margin: 2 }))
+            .then(url => { imgEl.src = url; })
+            .catch(() => {
                 imgEl.remove();
-                qrSection.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
+                qrSection.createEl('p', { text: 'Could not draw the QR code. Use Copy pairing code instead.', cls: 'od-text-muted' });
             });
-        
-        const scanBtn = qrSection.createEl('button', { text: 'Scan QR Code', cls: 'od-full-width' });
+
+        const scanBtn = qrSection.createEl('button', {
+            text: 'Scan their QR code',
+            cls: 'od-full-width',
+            attr: {
+                'aria-label': 'Scan their QR code',
+                title: 'Open the camera to scan the other device pairing QR code',
+            },
+        });
         scanBtn.onclick = () => {
             new QRScannerModal(this.app, (scannedId) => {
-                this.attemptConnection(scannedId);
+                this.attemptConnection(scannedId, 'scan');
             }).open();
         };
 
         contentEl.createDiv({ cls: 'od-section-divider' });
+        contentEl.createDiv({ text: 'Have their code?', cls: 'od-step-header' });
 
-        // Step 2: Enter Their Code
-        contentEl.createDiv({ text: 'Step 2: Enter Their Code', cls: 'od-step-header' });
-        
         const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
-        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter their pairing code or paste full key' });
-        
-        const connectBtn = inputRow.createEl('button', { text: 'Connect', cls: 'mod-cta' });
-        connectBtn.onclick = () => {
-            this.attemptConnection(input.value);
+        const input = inputRow.createEl('input', {
+            type: 'text',
+            placeholder: 'Paste the pairing code from the other device',
+            attr: { autocomplete: 'off', spellcheck: 'false' },
+        });
+        const connectBtn = inputRow.createEl('button', {
+            text: 'Connect',
+            cls: 'mod-cta',
+            attr: {
+                'aria-label': 'Connect with pairing code',
+                title: 'Connect using the pasted pairing code',
+            },
+        });
+        const submitPaste = () => this.attemptConnection(input.value, 'paste');
+        connectBtn.onclick = submitPaste;
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                submitPaste();
+            }
+        });
+        input.addEventListener('paste', () => {
+            window.setTimeout(() => {
+                if (parsePairingInput(input.value).kind === 'full') submitPaste();
+            }, 0);
+        });
+
+        this.renderNearbyList(contentEl);
+    }
+
+    private pairingValidityLabel(): string {
+        const remaining = this.plugin.activePskExpiresAt - Date.now();
+        if (remaining <= 0) return 'This pairing code has expired.';
+        const minutes = Math.max(1, Math.ceil(remaining / 60_000));
+        return minutes === 1 ? 'Code valid for 1 minute' : `Code valid for ${minutes} minutes`;
+    }
+
+    private renderPairingValidity(parent: HTMLElement) {
+        if (this.pairingValidityTimer) window.clearInterval(this.pairingValidityTimer);
+        const el = parent.createDiv({ text: this.pairingValidityLabel(), cls: 'od-instruction-text' });
+        this.pairingValidityTimer = window.setInterval(() => {
+            if (!el.isConnected) {
+                if (this.pairingValidityTimer) {
+                    window.clearInterval(this.pairingValidityTimer);
+                    this.pairingValidityTimer = null;
+                }
+                return;
+            }
+            el.setText(this.pairingValidityLabel());
+        }, 15000);
+    }
+
+    private renderDeviceNameField(parent: HTMLElement) {
+        const wrap = parent.createDiv({ cls: 'od-device-name-block' });
+        if (isGenericDeviceName(this.plugin.settings.friendlyName)) {
+            wrap.createDiv({
+                text: 'Name this device first — both sides default to the same label, so you cannot tell them apart.',
+                cls: 'mod-warning'
+            });
+        }
+        wrap.createDiv({ text: 'This device', cls: 'od-step-header' });
+        const row = wrap.createDiv({ cls: 'od-input-row' });
+        const input = row.createEl('input', {
+            type: 'text',
+            placeholder: 'Phone, Desktop…',
+            value: this.plugin.settings.friendlyName,
+            attr: { maxlength: '64', autocomplete: 'off' },
+        });
+        const save = async () => {
+            const ok = await this.plugin.setFriendlyName(input.value);
+            if (!ok) {
+                new Notice('Name must be 1–64 characters.');
+                input.value = this.plugin.settings.friendlyName;
+                return;
+            }
+            input.value = this.plugin.settings.friendlyName;
+        };
+        input.addEventListener('change', () => { void save(); });
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                void save();
+            }
+        });
+    }
+
+    private renderOfflineInsteadOfPairing(contentEl: HTMLElement) {
+        contentEl.createEl('h2', { text: 'Connect devices', cls: 'od-dashboard-header' });
+        contentEl.createDiv({
+            text: 'This vault is in Offline Mode. Pairing codes and QR need the standard connection and do not work here.',
+            cls: 'od-dashboard-subtitle'
+        });
+        contentEl.createDiv({
+            text: 'Host or join with an IP and token on the Offline Mode tab — that is also where this screen opens while Offline Mode is on.',
+            cls: 'od-instruction-text'
+        });
+        const go = contentEl.createEl('button', { text: 'Open Offline Mode', cls: 'mod-cta od-full-width' });
+        go.onclick = () => { this.activeTab = 'advanced'; this.render(); };
+        const back = contentEl.createEl('button', { text: 'Switch to Standard Mode', cls: 'od-full-width' });
+        back.onclick = async () => {
+            this.plugin.settings.connectionMode = 'peerjs';
+            await this.plugin.saveSettings();
+            this.plugin.reinitializeConnectionManager();
+            this.statusState = 'idle';
+            this.statusMessage = 'Ready to pair';
+            this.render();
+        };
+    }
+
+    private renderPairSuccess(contentEl: HTMLElement) {
+        const card = contentEl.createDiv({ cls: 'od-pair-success' });
+        card.createDiv({ text: `Paired with ${this.lastPairedName}.`, cls: 'od-pair-success-title' });
+        card.createDiv({
+            text: this.plugin.settings.peerKeys[this.lastPairedId!]
+                ? 'This link is encrypted. Both devices will try to reconnect automatically if you set a primary partner.'
+                : 'Paired, but this link is not encrypted.',
+            cls: 'od-instruction-text'
+        });
+
+        const otherDevices = Array.from(this.plugin.clusterPeers.values())
+            .filter(p => p.deviceId !== this.lastPairedId);
+        if (otherDevices.length > 0) {
+            const names = otherDevices.map(p => p.friendlyName).join(', ');
+            card.createDiv({
+                text: otherDevices.length === 1
+                    ? `${names} and ${this.lastPairedName} still need to pair with each other. Open Connect devices on those two and exchange the full code.`
+                    : `Your other devices (${names}) still need to pair with ${this.lastPairedName} directly. Pairing is one-to-one.`,
+                cls: 'od-instruction-text'
+            });
+        }
+
+        if (this.lastPairedId && this.plugin.settings.companionPeerId !== this.lastPairedId) {
+            const pairedId = this.lastPairedId;
+            const primaryBtn = card.createEl('button', { text: 'Keep us connected automatically', cls: 'mod-cta od-full-width' });
+            primaryBtn.onclick = async () => {
+                this.plugin.settings.companionPeerId = pairedId;
+                await this.plugin.saveSettings();
+                this.plugin.sendData(pairedId, { type: 'companion-pair', peerInfo: persistablePeerInfo(this.plugin.getMyPeerInfo()) });
+                this.plugin.tryToConnectToClusterPeers();
+                primaryBtn.setText('Saved as primary partner');
+                primaryBtn.disabled = true;
+            };
+        } else {
+            card.createDiv({ text: 'This is already your primary sync partner.', cls: 'od-text-muted' });
+        }
+
+        const done = card.createEl('button', { text: 'Done', cls: 'od-full-width od-spaced-top' });
+        done.onclick = () => this.close();
+
+        const another = card.createEl('button', { text: 'Pair another device', cls: 'od-full-width' });
+        another.onclick = () => {
+            this.lastPairedId = null;
+            this.lastPairedName = null;
+            this.statusState = 'idle';
+            this.statusMessage = 'Ready to pair';
+            this.render();
+        };
+    }
+
+    private renderNearbyList(contentEl: HTMLElement) {
+        contentEl.createDiv({ cls: 'od-section-divider' });
+        contentEl.createDiv({ text: 'Nearby on this Wi-Fi', cls: 'od-step-header' });
+
+        if (Platform.isMobile) {
+            contentEl.createDiv({
+                text: 'Nearby discovery is desktop-only. On this phone, paste the desktop pairing code or scan its QR.',
+                cls: 'od-instruction-text'
+            });
+            return;
+        }
+
+        const lanList = contentEl.createDiv({ cls: 'od-peer-list' });
+
+        const renderLanList = () => {
+            lanList.empty();
+            if (this.discoveredPeers.size === 0) {
+                const emptyState = lanList.createDiv({ cls: 'od-scanning' });
+                emptyState.createSpan({ cls: 'od-pulsing-indicator' });
+                emptyState.createSpan({ text: 'Looking for devices on this network…' });
+                return;
+            }
+            this.discoveredPeers.forEach((peer) => {
+                const alreadyPaired = this.plugin.connections.has(peer.deviceId)
+                    || !!this.plugin.settings.peerKeys[peer.deviceId];
+                const ready = !alreadyPaired && !!peer.pairingKey;
+                const card = lanList.createDiv({
+                    cls: `od-lan-card ${ready ? 'mod-clickable' : 'od-lan-card-wait'}`,
+                    attr: {
+                        'aria-label': alreadyPaired
+                            ? `${peer.friendlyName} is already paired`
+                            : ready
+                                ? `Pair with ${peer.friendlyName}`
+                                : `${peer.friendlyName} is not ready. Open Connect devices on that device first`,
+                        title: alreadyPaired
+                            ? 'Already paired'
+                            : ready
+                                ? `Tap to pair with ${peer.friendlyName}`
+                                : 'Open Connect devices on that device first',
+                    },
+                });
+                const title = card.createDiv({ cls: 'od-peer-name' });
+                title.setText(peer.friendlyName);
+                card.createDiv({
+                    text: alreadyPaired
+                        ? 'Already paired'
+                        : ready
+                            ? 'Ready to pair — tap to connect'
+                            : 'Open Connect devices on that device first',
+                    cls: 'od-text-muted'
+                });
+                if (ready) {
+                    card.onclick = () => this.attemptConnection(buildPairingPayload(peer.deviceId, peer.pairingKey!), 'nearby');
+                }
+            });
         };
 
-        // LAN Discovery
-        if (!Platform.isMobile) {
-            contentEl.createDiv({ cls: 'od-section-divider' });
-            contentEl.createDiv({ text: 'Or connect to nearby devices', cls: 'od-step-header' });
-            
-            const lanList = contentEl.createDiv({ cls: 'od-peer-list' });
-            
-            const renderLanList = () => {
-                lanList.empty();
-                if (this.discoveredPeers.size === 0) {
-                    const emptyState = lanList.createDiv({ cls: 'od-scanning' });
-                    emptyState.createSpan({ cls: 'od-pulsing-indicator' });
-                    emptyState.createSpan({ text: 'Scanning for devices...' });
-                } else {
-                    this.discoveredPeers.forEach((peer) => {
-                        const card = lanList.createDiv({ cls: 'od-lan-card mod-clickable' });
-                        card.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
-                        card.createDiv({ text: Platform.isMobile ? 'Tap to connect' : 'Click to connect', cls: 'od-text-muted' });
-                        card.onclick = () => this.attemptConnection(peer.deviceId);
-                    });
-                }
-            };
-            
-            if (this.discoverListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('discover', this.discoverListener);
-            if (this.loseListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('lose', this.loseListener);
+        if (this.discoverListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('discover', this.discoverListener);
+        if (this.loseListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('lose', this.loseListener);
 
-            this.discoverListener = (p: PeerInfo) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); };
-            this.loseListener = (p: PeerInfo) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); };
+        this.discoverListener = (p: PeerInfo) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); };
+        this.loseListener = (p: PeerInfo) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); };
 
-            if (this.plugin.lanDiscovery) {
-                this.plugin.lanDiscovery.on('discover', this.discoverListener);
-                this.plugin.lanDiscovery.on('lose', this.loseListener);
-                this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
-                this.plugin.lanDiscovery.startListening();
-                // Seed with peers discovered BEFORE this modal opened — their
-                // 'discover' events fired long ago and won't fire again.
-                for (const p of this.plugin.lanDiscovery.getDiscoveredPeers()) {
-                    this.discoveredPeers.set(p.deviceId, p);
-                }
+        if (this.plugin.lanDiscovery) {
+            this.plugin.lanDiscovery.on('discover', this.discoverListener);
+            this.plugin.lanDiscovery.on('lose', this.loseListener);
+            this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
+            this.plugin.lanDiscovery.startListening();
+            for (const p of this.plugin.lanDiscovery.getDiscoveredPeers()) {
+                this.discoveredPeers.set(p.deviceId, p);
             }
-            renderLanList();
         }
+        renderLanList();
     }
 
     renderAdvancedTab() {
@@ -355,12 +665,15 @@ export class ConnectionModal extends Modal {
             return;
         }
 
-        contentEl.createEl('h2', { text: 'Advanced Configuration', cls: 'od-dashboard-header' });
-        contentEl.createDiv({ text: 'Manual connection options and settings', cls: 'od-dashboard-subtitle' });
+        contentEl.createEl('h2', { text: 'Advanced', cls: 'od-dashboard-header' });
+        contentEl.createDiv({ text: 'Use this only when Quick Pair cannot reach the other device.', cls: 'od-dashboard-subtitle' });
 
-        // Offline Mode Switch
-        contentEl.createDiv({ cls: 'od-section-title', text: 'Offline Mode (Direct IP)' });
-        contentEl.createEl('p', { text: 'Use Offline Mode when you have no internet access but are on the same local network.', cls: 'od-text-muted', attr: { style: 'font-size: 0.85em;' } });
+        contentEl.createDiv({ cls: 'od-section-title', text: 'Offline Mode (same Wi-Fi, no internet)' });
+        contentEl.createEl('p', {
+            text: 'One desktop hosts. Other devices join with that desktop’s IP and token. Nothing goes through a signaling server.',
+            cls: 'od-text-muted',
+            attr: { style: 'font-size: 0.85em;' }
+        });
         
         const footer = contentEl.createDiv({ cls: 'od-mode-switch', attr: { style: 'margin-top: 10px;' } });
         footer.setText("Switch to Offline Mode");
@@ -379,6 +692,19 @@ export class ConnectionModal extends Modal {
         
         const container = contentEl.createDiv({ cls: 'od-direct-ip-wrapper' });
 
+        if (this.plugin.directIpServer) {
+            this.renderHostingCredentials(container, this.plugin.directIpServer.getPin());
+            this.renderStandardModeSwitch(contentEl);
+            return;
+        }
+
+        const client = this.plugin.directIpClient;
+        if (client && !client.isFatalError) {
+            this.renderOfflineClientStatus(container, client);
+            this.renderStandardModeSwitch(contentEl);
+            return;
+        }
+
         container.createDiv({ cls: 'od-section-title', text: 'Step 1: Host a Network (Main device)' });
         if (!Platform.isMobile) {
             const hostBtn = container.createEl('button', { text: 'Start Hosting', cls: 'mod-cta od-full-width' });
@@ -395,25 +721,12 @@ export class ConnectionModal extends Modal {
                 // A null token means the socket never bound; startDirectIpHost has already
                 // explained why, so don't paint a "Hosting Active" screen over the failure.
                 if (!pin) return;
-
-                const ip = this.plugin.getLocalIp();
-                contentEl.empty();
-                contentEl.createEl('h2', { text: 'Hosting Active', cls: 'od-dashboard-header' });
-                contentEl.createDiv({
-                    text: ip ? `IP: ${ip}` : 'No network address found — check that you are connected to Wi-Fi or Ethernet.',
-                    cls: 'od-ip-display'
-                });
-                contentEl.createDiv({ text: `Token: ${pin}`, cls: 'od-pin-display od-token' });
-                const copyBtn = contentEl.createEl('button', { text: 'Copy token', cls: 'od-full-width od-spaced-top' });
-                copyBtn.onclick = async () => {
-                    await navigator.clipboard.writeText(pin!);
-                    copyBtn.setText('Copied');
-                    setTimeout(() => copyBtn.setText('Copy token'), 1500);
-                };
-                contentEl.createEl('button', { text: 'Done', cls: 'od-full-width od-spaced-top' }).onclick = () => this.close();
+                this.statusState = 'connected';
+                this.statusMessage = 'Hosting — waiting for devices';
+                this.render();
             };
         } else {
-            container.createDiv({ text: 'Hosting is not available on mobile.', cls: 'od-text-muted' });
+            container.createDiv({ text: 'Hosting is not available on mobile. Join from here using the desktop’s IP and token.', cls: 'od-text-muted' });
         }
 
         if (!Platform.isMobile) {
@@ -462,6 +775,13 @@ export class ConnectionModal extends Modal {
 
         container.createDiv({ cls: 'od-section-divider' });
 
+        if (client?.isFatalError) {
+            container.createDiv({
+                text: 'The host rejected this token. Check the IP and token from the hosting device and try again.',
+                cls: 'mod-warning'
+            });
+        }
+
         container.createDiv({ cls: 'od-section-title', text: 'Step 2: Join a Network (Other devices)' });
         const ipInput = container.createEl('input', { type: 'text', placeholder: 'Host IP Address' });
         ipInput.value = this.plugin.settings.directIpHostAddress || '';
@@ -472,17 +792,120 @@ export class ConnectionModal extends Modal {
 
         const connectBtn = container.createEl('button', { text: 'Connect', cls: 'mod-cta od-full-width' });
         connectBtn.onclick = async () => {
-            if (ipInput.value && pinInput.value) {
-                this.plugin.settings.directIpHostAddress = ipInput.value;
-                await this.plugin.saveSettings();
-                this.plugin.connectToDirectIpHost({ host: ipInput.value, port: this.plugin.settings.directIpHostPort, pin: pinInput.value });
-                this.close();
-            } else {
-                new Notice('Please provide both IP and Token');
+            const host = ipInput.value.trim();
+            const token = pinInput.value.trim();
+            if (!host || !token) {
+                new Notice('Enter both the host IP and the token.');
+                return;
+            }
+            this.plugin.settings.directIpHostAddress = host;
+            await this.plugin.saveSettings();
+            this.statusState = 'connecting';
+            this.statusMessage = 'Connecting to the offline host… keep this screen open.';
+            this.plugin.connectToDirectIpHost({ host, port: this.plugin.settings.directIpHostPort, pin: token });
+            this.render();
+            this.watchDirectIpClient();
+        };
+
+        this.renderStandardModeSwitch(contentEl);
+    }
+
+    private renderHostingCredentials(container: HTMLElement, pin: string) {
+        const addrs = this.plugin.getLocalIps();
+        const ip = addrs[0]?.address ?? null;
+        const port = this.plugin.settings.directIpHostPort;
+        container.createDiv({ cls: 'od-section-title', text: 'Hosting on this network' });
+        renderHostAddresses(container, addrs, port);
+        container.createDiv({ text: `Token: ${pin}`, cls: 'od-pin-display od-token' });
+        container.createDiv({
+            text: 'On the other device open Connect devices → Offline Mode, then enter this IP and token. Reopen this screen anytime to see them again.',
+            cls: 'od-instruction-text'
+        });
+
+        const copyToken = container.createEl('button', { text: 'Copy token', cls: 'mod-cta od-full-width od-spaced-top' });
+        copyToken.onclick = async () => {
+            try {
+                await navigator.clipboard.writeText(pin);
+                copyToken.setText('Copied');
+                window.setTimeout(() => copyToken.setText('Copy token'), 1500);
+            } catch {
+                new Notice('Select the token and copy it (Ctrl+C / Cmd+C).');
             }
         };
 
-        const footer = contentEl.createDiv({ cls: 'od-mode-switch' });
+        if (ip) {
+            const share = `${ip}\n${pin}`;
+            const copyBoth = container.createEl('button', { text: 'Copy IP and token', cls: 'od-full-width' });
+            copyBoth.onclick = async () => {
+                try {
+                    await navigator.clipboard.writeText(share);
+                    copyBoth.setText('Copied');
+                    window.setTimeout(() => copyBoth.setText('Copy IP and token'), 1500);
+                } catch {
+                    new Notice('Select the IP and token and copy them (Ctrl+C / Cmd+C).');
+                }
+            };
+        }
+    }
+
+    private renderOfflineClientStatus(container: HTMLElement, client: { isOpen: boolean; isLive: boolean }) {
+        const host = this.plugin.settings.directIpHostAddress || 'the host';
+        const live = client.isOpen && client.isLive;
+        if (!client.isOpen) {
+            container.createDiv({ text: `Reconnecting to ${host}…`, cls: 'od-instruction-text' });
+        } else if (!client.isLive) {
+            container.createDiv({ text: `Verifying the link to ${host}…`, cls: 'od-instruction-text' });
+        } else {
+            container.createDiv({ text: `Connected to the offline host at ${host}.`, cls: 'od-instruction-text' });
+        }
+        container.createDiv({
+            text: live
+                ? 'Leave this vault open to stay connected. Disconnect to join a different host or start hosting on this device.'
+                : 'If the IP or token is wrong, cancel and try again — you do not need to leave Offline Mode.',
+            cls: 'od-text-muted'
+        });
+        const leave = container.createEl('button', {
+            text: live ? 'Disconnect' : 'Try a different host',
+            cls: live ? 'od-full-width od-spaced-top' : 'mod-cta od-full-width od-spaced-top',
+        });
+        leave.onclick = () => {
+            if (this.handshakeTimer) window.clearTimeout(this.handshakeTimer);
+            this.plugin.reinitializeConnectionManager();
+            this.statusState = 'idle';
+            this.statusMessage = 'Ready to pair';
+            this.render();
+        };
+    }
+
+    private watchDirectIpClient() {
+        if (this.handshakeTimer) window.clearTimeout(this.handshakeTimer);
+        const started = Date.now();
+        const tick = () => {
+            const client = this.plugin.directIpClient;
+            if (!client) return;
+            if (client.isFatalError) {
+                this.fail('The host rejected this token. Check it and try again.');
+                return;
+            }
+            if (client.isLive) {
+                this.statusState = 'connected';
+                this.statusMessage = `Connected to ${this.plugin.settings.directIpHostAddress}`;
+                this.render();
+                return;
+            }
+            if (Date.now() - started > 20000) {
+                this.statusState = 'reconnecting';
+                this.statusMessage = 'Still trying to reach the host. Check the IP and that the other device is hosting.';
+                this.render();
+                return;
+            }
+            this.handshakeTimer = window.setTimeout(tick, 200);
+        };
+        tick();
+    }
+
+    private renderStandardModeSwitch(parent: HTMLElement) {
+        const footer = parent.createDiv({ cls: 'od-mode-switch' });
         footer.setText("Switch to Standard Mode");
         footer.onclick = async () => {
             this.plugin.settings.connectionMode = 'peerjs';
@@ -502,7 +925,13 @@ export class QRScannerModal extends Modal {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Scan QR Code' });
         const readerId = 'od-qr-reader';
-        contentEl.createDiv({ attr: { id: readerId } });
+        contentEl.createDiv({
+            attr: {
+                id: readerId,
+                'aria-label': 'Camera viewfinder for scanning a pairing QR code',
+                title: 'Point the camera at the other device pairing QR code',
+            },
+        });
 
         // The scanner library is loaded on demand; onClose may run before it resolves,
         // so startPromise gates cleanup on the whole load-and-start sequence.
@@ -513,7 +942,20 @@ export class QRScannerModal extends Modal {
                 this.close();
             }, () => {});
         }).catch(err => {
-            contentEl.createEl('p', { text: 'Error starting camera: ' + err, cls: 'mod-warning' });
+            const raw = err instanceof Error ? err.message : String(err);
+            const hint = /permission|notallowed|denied/i.test(raw)
+                ? 'Camera permission was denied. Allow the camera, or paste the pairing code instead.'
+                : /notfound|requested device not found|overconstrained/i.test(raw)
+                    ? 'No camera found. Paste the pairing code instead.'
+                    : 'Could not start the camera. Paste the pairing code instead.';
+            contentEl.createEl('p', { text: hint, cls: 'mod-warning' });
+            new Setting(contentEl).addButton(btn => {
+                btn.setButtonText('Paste the pairing code instead')
+                    .setCta()
+                    .setTooltip('Close and paste the pairing code instead')
+                    .onClick(() => this.close());
+                btn.buttonEl?.setAttribute('aria-label', 'Close scanner and paste the pairing code instead');
+            });
         });
     }
     
@@ -540,17 +982,20 @@ export class QRScannerModal extends Modal {
 }
 
 export class SelectPeerModal extends Modal {
-    constructor(app: App, private connections: Map<string, DataConnection>, private clusterPeers: Map<string, PeerInfo>, private onSubmit: (peerId: string) => void) { super(app); }
+    constructor(app: App, private plugin: ObsidianDecentralizedPlugin, private onSubmit: (peerId: string) => void) { super(app); }
     
     onOpen() {
         const { contentEl } = this;
-        contentEl.createEl('h2', { text: 'Force Full Sync with Peer' });
-        contentEl.createEl('p', { text: 'This will perform a two-way sync. Files will be exchanged based on which is newer. This is the safest way to reconcile two vaults.' }).addClass('mod-warning');
+        contentEl.createEl('h2', { text: 'Force full sync' });
+        contentEl.createEl('p', { text: 'Compares both vaults and exchanges whichever copy of each file is newer. Use this if the two devices look out of step.' });
         let selectedPeer = '';
-        const peerList = Array.from(this.connections.keys());
+        const peerList = Array.from(this.plugin.connections.keys());
         if (peerList.length === 0) {
-            contentEl.createEl('p', { text: 'No peers are currently connected.' });
-            new Setting(contentEl).addButton(btn => btn.setButtonText("OK").onClick(() => this.close()));
+            contentEl.createEl('p', { text: 'No device is connected right now. Pair one first, then run a full sync.' });
+            new Setting(contentEl).addButton(btn => btn.setButtonText('Connect devices').setCta().onClick(() => {
+                this.close();
+                new ConnectionModal(this.app, this.plugin).open();
+            }));
             return;
         }
         if (peerList.length > 0) {
@@ -558,7 +1003,7 @@ export class SelectPeerModal extends Modal {
         }
         new Setting(contentEl).setName('Sync with Device').addDropdown(dropdown => {
             peerList.forEach(peerId => {
-                const peerInfo = this.clusterPeers.get(peerId);
+                const peerInfo = this.plugin.clusterPeers.get(peerId);
                 dropdown.addOption(peerId, peerInfo?.friendlyName || peerId);
             });
             dropdown.setValue(selectedPeer);
@@ -566,7 +1011,7 @@ export class SelectPeerModal extends Modal {
         });
         new Setting(contentEl)
             .addButton(btn => btn.setButtonText('Cancel').onClick(() => this.close()))
-            .addButton(btn => btn.setButtonText('Start Full Sync').setWarning().onClick(() => {
+            .addButton(btn => btn.setButtonText('Start full sync').setWarning().onClick(() => {
                 if (selectedPeer) this.onSubmit(selectedPeer);
                 this.close();
             }));
@@ -586,6 +1031,27 @@ export class ConflictCenter {
     registerRibbon() {
         this.ribbonEl = this.plugin.addRibbonIcon('swords', 'Resolve Sync Conflicts', () => this.showConflictList());
         this.ribbonEl.style.display = 'none';
+    }
+
+    /** Rebuild from leftover ` (conflict on DATE)` copies so the ribbon survives a restart. */
+    scanVault() {
+        const found = new Map<string, string>();
+        for (const file of this.app.vault.getFiles()) {
+            const original = originalPathFromConflictCopy(file.path);
+            if (!original) continue;
+            if (!this.app.vault.getAbstractFileByPath(original)) continue;
+            if (!found.has(original)) found.set(original, file.path);
+        }
+        this.conflicts = found;
+        this.updateRibbon();
+    }
+
+    count(): number {
+        return this.conflicts.size;
+    }
+
+    entries(): IterableIterator<[string, string]> {
+        return this.conflicts.entries();
     }
     
     addConflict(originalPath: string, conflictPath: string) {
@@ -617,6 +1083,7 @@ export class ConflictCenter {
     }
     
     showConflictList() {
+        this.scanVault();
         new ConflictListModal(this.app, this, this.plugin).open();
     }
 }
@@ -627,58 +1094,71 @@ export class ConflictListModal extends Modal {
     onOpen() {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Sync Conflicts' });
-        const conflicts: Map<string, string> = (this.conflictCenter as any).conflicts;
-        if (conflicts.size === 0) {
-            contentEl.createEl('p', { text: 'No conflicts to resolve.' });
+        if (this.conflictCenter.count() === 0) {
+            contentEl.createEl('p', { text: 'No leftover conflict copies in this vault.' });
+            contentEl.createEl('p', {
+                text: 'When two devices edit the same note, a second file named “Note (conflict on DATE)” is created and listed here — including after you restart Obsidian.',
+                cls: 'od-text-muted'
+            });
             return;
         }
-        conflicts.forEach((conflictPath, originalPath) => {
-            new Setting(contentEl).setName(originalPath).setDesc(`Conflict file: ${conflictPath}`)
+        for (const [originalPath, conflictPath] of this.conflictCenter.entries()) {
+            new Setting(contentEl).setName(originalPath).setDesc(`Other version: ${conflictPath}`)
                 .addButton(btn => btn.setButtonText('Resolve').setCta().onClick(async () => {
                     this.close();
                     await this.showResolutionModal(originalPath, conflictPath);
                 }));
-        });
+        }
     }
     
     async showResolutionModal(originalPath: string, conflictPath: string) {
         const originalFile = this.app.vault.getAbstractFileByPath(originalPath) as TFile;
         const conflictFile = this.app.vault.getAbstractFileByPath(conflictPath) as TFile;
         if (!originalFile || !conflictFile) {
-                this.plugin.showNotice("One of the conflict files is missing.", 'error');
-                this.conflictCenter.resolveConflict(originalPath);
-                return;
-            }
-            try {
-                if (this.plugin.isBinary(originalFile.extension)) {
-                    new BinaryConflictResolutionModal(this.app, originalFile.name, async (choice) => {
-                        this.plugin.ignoreNextEventForPath(originalPath);
-                        if (choice === 'remote') {
-                            const remoteData = await this.app.vault.readBinary(conflictFile);
-                            await this.app.vault.modifyBinary(originalFile, remoteData);
-                        }
-                        this.plugin.ignoreNextEventForPath(conflictPath);
-                        await this.app.vault.delete(conflictFile);
-                        this.conflictCenter.resolveConflict(originalPath);
-                        this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
-                    }).open();
-                } else {
-                    const localContent = await this.app.vault.read(originalFile);
-                    const remoteContent = await this.app.vault.read(conflictFile);
-                    new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => {
-                        this.plugin.ignoreNextEventForPath(originalPath);
-                        await this.app.vault.modify(originalFile, chosenContent);
-                        this.plugin.ignoreNextEventForPath(conflictPath);
-                        await this.app.vault.delete(conflictFile);
-                        this.conflictCenter.resolveConflict(originalPath);
-                        this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
-                    }).open();
-                }
-            } catch (e) {
-                new Notice('Failed to read conflict files: ' + (e instanceof Error ? e.message : String(e)));
-                this.conflictCenter.resolveConflict(originalPath);
-            }
+            this.plugin.showNotice("One of the conflict files is missing.", 'error');
+            this.conflictCenter.resolveConflict(originalPath);
+            this.reopenIfMoreRemain();
+            return;
         }
+        try {
+            const backToList = () => this.reopenIfMoreRemain();
+            if (this.plugin.isBinary(originalFile.extension)) {
+                new BinaryConflictResolutionModal(this.app, originalFile.name, async (choice) => {
+                    this.plugin.ignoreNextEventForPath(originalPath);
+                    if (choice === 'remote') {
+                        const remoteData = await this.app.vault.readBinary(conflictFile);
+                        await this.app.vault.modifyBinary(originalFile, remoteData);
+                    }
+                    this.plugin.ignoreNextEventForPath(conflictPath);
+                    await this.app.vault.delete(conflictFile);
+                    this.conflictCenter.resolveConflict(originalPath);
+                    this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
+                    this.reopenIfMoreRemain();
+                }, backToList).open();
+            } else {
+                const localContent = await this.app.vault.read(originalFile);
+                const remoteContent = await this.app.vault.read(conflictFile);
+                new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => {
+                    this.plugin.ignoreNextEventForPath(originalPath);
+                    await this.app.vault.modify(originalFile, chosenContent);
+                    this.plugin.ignoreNextEventForPath(conflictPath);
+                    await this.app.vault.delete(conflictFile);
+                    this.conflictCenter.resolveConflict(originalPath);
+                    this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
+                    this.reopenIfMoreRemain();
+                }, backToList).open();
+            }
+        } catch (e) {
+            new Notice('Failed to read conflict files: ' + (e instanceof Error ? e.message : String(e)));
+            this.conflictCenter.resolveConflict(originalPath);
+            this.reopenIfMoreRemain();
+        }
+    }
+
+    private reopenIfMoreRemain() {
+        this.conflictCenter.scanVault();
+        if (this.conflictCenter.count() > 0) this.conflictCenter.showConflictList();
+    }
     
     onClose() {
         this.contentEl.empty();
@@ -686,7 +1166,14 @@ export class ConflictListModal extends Modal {
 }
 
 export class ConflictResolutionModal extends Modal {
-    constructor(app: App, private localContent: string, private remoteContent: string, private onResolve: (chosenContent: string) => void) { super(app); }
+    private decided = false;
+    constructor(
+        app: App,
+        private localContent: string,
+        private remoteContent: string,
+        private onResolve: (chosenContent: string) => void,
+        private onDismiss?: () => void,
+    ) { super(app); }
     
     onOpen() {
         const { contentEl } = this;
@@ -703,11 +1190,14 @@ export class ConflictResolutionModal extends Modal {
             if (op === -1) span.addClass('od-diff-delete');
         }
         new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('Decide later').onClick(() => this.close()))
             .addButton(btn => btn.setButtonText('Keep My Version').onClick(() => {
+                this.decided = true;
                 this.onResolve(this.localContent);
                 this.close();
             }))
             .addButton(btn => btn.setButtonText('Use Their Version').setWarning().onClick(() => {
+                this.decided = true;
                 this.onResolve(this.remoteContent);
                 this.close();
             }));
@@ -715,27 +1205,40 @@ export class ConflictResolutionModal extends Modal {
     
     onClose() {
         this.contentEl.empty();
+        if (!this.decided) this.onDismiss?.();
     }
 }
 
 export class BinaryConflictResolutionModal extends Modal {
-    constructor(app: App, private fileName: string, private onResolve: (choice: 'local' | 'remote') => void) { super(app); }
+    private decided = false;
+    constructor(
+        app: App,
+        private fileName: string,
+        private onResolve: (choice: 'local' | 'remote') => void,
+        private onDismiss?: () => void,
+    ) { super(app); }
     
     onOpen() {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Resolve Binary Conflict' });
         contentEl.createEl('p', { text: `The file "${this.fileName}" is a binary file (e.g. image, pdf, audio). Differences cannot be shown.` });
-        new Setting(contentEl).addButton(btn => btn.setButtonText('Keep My Version (Local)').onClick(() => {
-            this.onResolve('local');
-            this.close();
-        })).addButton(btn => btn.setButtonText('Use Their Version (Remote)').setWarning().onClick(() => {
-            this.onResolve('remote');
-            this.close();
-        }));
+        new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('Decide later').onClick(() => this.close()))
+            .addButton(btn => btn.setButtonText('Keep My Version (Local)').onClick(() => {
+                this.decided = true;
+                this.onResolve('local');
+                this.close();
+            }))
+            .addButton(btn => btn.setButtonText('Use Their Version (Remote)').setWarning().onClick(() => {
+                this.decided = true;
+                this.onResolve('remote');
+                this.close();
+            }));
     }
     
     onClose() {
         this.contentEl.empty();
+        if (!this.decided) this.onDismiss?.();
     }
 }
 
@@ -798,8 +1301,10 @@ export class SyncProgressModal extends Modal {
      */
     private stateSignature(): string {
         const s = this.plugin.syncState;
+        const queued = this.plugin.queueManager.getQueueSize() + this.plugin.queueManager.getActiveTransfers();
         const parts: string[] = [
             s.isSyncing ? `S${s.currentPhase}|${s.filesTransferred}/${s.filesTotal}|${s.bytesTransferred}/${s.bytesTotal}|${s.currentFile ?? ''}|${s.currentFileSize ?? ''}` : 'S-',
+            `Q${queued}`,
         ];
         for (const t of this.plugin.activeTransfers.values()) {
             parts.push(`T${t.id}:${t.processedChunks}/${t.totalChunks}:${t.status}:${t.direction}`);
@@ -807,7 +1312,7 @@ export class SyncProgressModal extends Modal {
         for (const f of this.plugin.failedSyncs) {
             parts.push(`F${f.path}:${f.type}:${f.retryCount}:${f.timestamp}`);
         }
-        const busy = s.isSyncing || this.plugin.activeTransfers.size > 0;
+        const busy = s.isSyncing || this.plugin.activeTransfers.size > 0 || queued > 0;
         if (busy) parts.push(`t${Math.floor(Date.now() / 1000)}`);
         return parts.join('\n');
     }
@@ -823,7 +1328,34 @@ export class SyncProgressModal extends Modal {
         const isSyncing = this.plugin.syncState.isSyncing;
 
         if (!hasActive && !hasFailed && !isSyncing) {
-            this.container.createEl('p', { text: 'No active file transfers or syncs.' });
+            const queued = this.plugin.queueManager.getQueueSize() + this.plugin.queueManager.getActiveTransfers();
+            if (queued > 0) {
+                this.container.createEl('p', {
+                    text: queued === 1
+                        ? 'Waiting to send 1 recent change…'
+                        : `Waiting to send ${queued} recent changes…`,
+                });
+                this.container.createEl('p', {
+                    text: 'File-by-file progress appears here once a transfer starts.',
+                    cls: 'od-text-muted',
+                });
+                return;
+            }
+            this.container.createEl('p', { text: 'Nothing is syncing right now.' });
+            this.container.createEl('p', {
+                text: 'When notes move between devices, progress shows up here. Pair a device first, or run a full sync if one is already connected.',
+                cls: 'od-text-muted',
+            });
+            new Setting(this.container).addButton(btn => btn.setButtonText('Connect devices').setCta().onClick(() => {
+                this.close();
+                new ConnectionModal(this.app, this.plugin).open();
+            }));
+            if (this.plugin.connections.size > 0) {
+                new Setting(this.container).addButton(btn => btn.setButtonText('Force full sync').onClick(() => {
+                    this.close();
+                    new SelectPeerModal(this.app, this.plugin, (peerId) => this.plugin.requestFullSyncFromPeer(peerId)).open();
+                }));
+            }
             return;
         }
 

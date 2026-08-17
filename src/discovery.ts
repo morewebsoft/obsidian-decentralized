@@ -144,7 +144,7 @@ export class DesktopLANDiscovery implements ILANDiscovery {
                 console.log(`LAN Discovery listening on ${DISCOVERY_MULTICAST_ADDRESS}:${DISCOVERY_PORT}`);
             } catch (e) {
                 console.error("Error setting up multicast:", e);
-                new Notice("Could not set up multicast. LAN discovery might not work.");
+                new Notice("Nearby devices may not appear. Paste the pairing code.");
             }
         });
 
@@ -159,11 +159,16 @@ export class DesktopLANDiscovery implements ILANDiscovery {
                         clearTimeout(this.peerTimeouts.get(peerId)!);
                     }
 
-                    const isNew = !this.discoveredPeers.has(peerId);
+                    const prev = this.discoveredPeers.get(peerId);
+                    const isNew = !prev;
                     data.peerInfo.ip = rinfo.address;
                     this.discoveredPeers.set(peerId, data.peerInfo);
-                    if (isNew) {
-                        this.currentBroadcastIntervalMs = 2000;
+                    // Re-emit when the pairing key appears or disappears so a
+                    // nearby list that already showed this device can switch
+                    // from "open Connect on that device" to a real Connect tap.
+                    const pairingChanged = !!prev && prev.pairingKey !== data.peerInfo.pairingKey;
+                    if (isNew || pairingChanged) {
+                        if (isNew) this.currentBroadcastIntervalMs = 2000;
                         this.emit('discover', data.peerInfo);
                     }
 

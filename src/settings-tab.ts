@@ -1,7 +1,8 @@
 import { App, PluginSettingTab, Setting, setIcon, Notice } from 'obsidian';
 import type ObsidianDecentralizedPlugin from './main';
 import { PeerInfo, DEFAULT_SETTINGS, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE } from './types';
-import { ConnectionModal, ConfirmModal } from './ui';
+import { ConnectionModal, ConfirmModal, renderHostAddresses } from './ui';
+import { persistablePeerInfo } from './utils/pairing';
 
 export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     plugin: ObsidianDecentralizedPlugin;
@@ -25,19 +26,42 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
         containerEl.createEl('h2', { text: 'Obsidian Decentralized' });
-        const isAuto = this.plugin.settings.syncMode === 'auto';
 
         const statusContainer = containerEl.createDiv();
-        statusContainer.createEl('h3', { text: 'Live Status' });
+        statusContainer.createEl('h3', { text: 'Status' });
         this.statusTextEl = statusContainer.createDiv({ cls: 'obsidian-decentralized-status-text' });
-        this.statusTextEl.style.fontFamily = 'monospace';
         this.statusTextEl.style.marginBottom = '1em';
 
         new Setting(containerEl)
-            .setName(isAuto ? 'Settings Profile' : 'Mode')
-            .setDesc(isAuto ? 'Auto mode is easiest and syncs everything safely. Manual lets you pick folders and behaviors. Advanced unlocks all technical settings.' : 'Auto mode syncs all files. Manual mode allows configuration. Advanced mode unlocks all settings.')
+            .setName('This device')
+            .setDesc('Shown on your other devices when pairing. Use something you will recognize (Phone, Desktop).')
+            .addText(text => text
+                .setPlaceholder('Phone, Desktop…')
+                .setValue(this.plugin.settings.friendlyName)
+                .onChange(async (value) => {
+                    const ok = await this.plugin.setFriendlyName(value);
+                    if (!ok && value.trim()) new Notice('Name must be 1–64 characters.');
+                }));
+
+        if (this.plugin.settings.syncMode === 'advanced') {
+            const idLine = containerEl.createDiv({ cls: 'od-device-id-support' });
+            idLine.setText(`${this.plugin.settings.deviceId} · not the pairing code`);
+            idLine.setAttr('title', 'Click to copy. This is not the pairing code.');
+            idLine.onclick = async () => {
+                try {
+                    await navigator.clipboard.writeText(this.plugin.settings.deviceId);
+                    new Notice('Device ID copied. This is not the pairing code.');
+                } catch {
+                    new Notice('Select the ID and copy it.');
+                }
+            };
+        }
+
+        new Setting(containerEl)
+            .setName('How much to show')
+            .setDesc('Auto just works — everything syncs the safe way. Manual lets you pick folders and extras. Advanced adds extra technical options.')
             .addDropdown(dd => dd
-                .addOption('auto', 'Auto (Recommended)')
+                .addOption('auto', 'Auto (recommended)')
                 .addOption('manual', 'Manual')
                 .addOption('advanced', 'Advanced')
                 .setValue(this.plugin.settings.syncMode)
@@ -48,27 +72,27 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName('Connect Devices')
-            .setDesc('Open the connection helper to pair with your other devices.')
+            .setName('Connect devices')
+            .setDesc('Pair another phone or computer. The code on that screen is the whole pairing code — copy it, don’t retype the short ID.')
             .addButton(btn => btn.setButtonText("Connect").setCta().onClick(() => new ConnectionModal(this.app, this.plugin).open()));
 
-        containerEl.createEl('h3', { text: 'Current Cluster' });
+        containerEl.createEl('h3', { text: 'Your devices' });
         this.clusterStatusEl = containerEl.createDiv();
         this.updateStatus();
 
         // Shared Settings (Visible in both modes)
         containerEl.createEl('h3', { text: 'Settings' });
         new Setting(containerEl)
-            .setName("Excluded folders")
-            .setDesc("Never sync folders in this list. One folder per line. Example: 'Attachments/Large Files'.")
-            .addTextArea(text => text.setPlaceholder("Path/To/Exclude\nAnother/Path").setValue(this.plugin.settings.excludedFolders).onChange(async (value) => { this.plugin.settings.excludedFolders = value; await this.plugin.saveSettings(); }));
+            .setName("Don't sync these folders")
+            .setDesc("Anything listed here stays on this device only. One folder per line, like Attachments/Large Files.")
+            .addTextArea(text => text.setPlaceholder("Attachments/Large Files\nArchive").setValue(this.plugin.settings.excludedFolders).onChange(async (value) => { this.plugin.settings.excludedFolders = value; await this.plugin.saveSettings(); }));
 
         if (this.plugin.settings.syncMode === 'manual' || this.plugin.settings.syncMode === 'advanced') {
             this.displayManualSettings(containerEl);
         } else {
              new Setting(containerEl)
-                .setName('Show Sync Notifications')
-                .setDesc('Show notifications for sync progress. Errors and conflicts always appear. Network drop/reconnect chatter is never shown as a notification — watch the status bar for that.')
+                .setName('Notify me when files sync')
+                .setDesc('Pops up while files are copying. Problems and conflicts always show. Connection drops stay in the status bar — they never pop up.')
                 .addToggle(toggle => toggle
                     .setValue(this.plugin.settings.showToasts)
                     .onChange(async (value) => {
@@ -86,11 +110,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     }
 
     displayManualSettings(containerEl: HTMLElement): void {
-        containerEl.createEl('h4', { text: 'Manual Configuration' });
+        containerEl.createEl('h4', { text: 'More options' });
 
         new Setting(containerEl)
-            .setName('Show Sync Notifications')
-            .setDesc('Show notifications for sync progress. Errors and conflicts always appear. Network drop/reconnect chatter is never shown as a notification — watch the status bar for that.')
+            .setName('Notify me when files sync')
+            .setDesc('Pops up while files are copying. Problems and conflicts always show. Connection drops stay in the status bar — they never pop up.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.showToasts)
                 .onChange(async (value) => {
@@ -99,11 +123,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName("Conflict Resolution Strategy")
-            .setDesc("How to handle a file being edited on two devices at once.")
+            .setName("When both devices change the same note")
+            .setDesc("If you edit a file here and on another device before they sync, choose what happens.")
             .addDropdown(dd => dd
-                .addOption('create-conflict-file', 'Create Conflict File (Safest)')
-                .addOption('last-write-wins', 'Last Write Wins (Newest file is kept)')
+                .addOption('create-conflict-file', 'Keep both copies (safest)')
+                .addOption('last-write-wins', 'Keep the newest, drop the other')
                 .setValue(this.plugin.settings.conflictResolutionStrategy)
                 .onChange(async (value: 'create-conflict-file' | 'last-write-wins') => {
                     this.plugin.settings.conflictResolutionStrategy = value;
@@ -111,8 +135,8 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName("Sync all file types")
-            .setDesc("Sync not just markdown, but also images, PDFs, etc. This will increase sync traffic.")
+            .setName("Also sync pictures, PDFs, and other files")
+            .setDesc("Off: only notes and other text. On: images, PDFs, and the rest — uses more data and can take longer.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.syncAllFileTypes)
                 .onChange(async (value) => {
@@ -121,8 +145,8 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName("Sync '.obsidian' configuration folder")
-            .setDesc("DANGEROUS: Syncs settings, themes, and snippets. Can cause issues if devices have different plugins or Obsidian versions. BACKUP FIRST.")
+            .setName("Also sync Obsidian settings (.obsidian)")
+            .setDesc("Risky. Copies themes, snippets, and plugin settings to your other devices. Only turn this on if they use the same plugins and Obsidian version — and make a backup first.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.syncObsidianConfig)
                 .onChange(async (value) => {
@@ -131,8 +155,8 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName('Hide Obsidian Sync status')
-            .setDesc('Hide the native Obsidian Sync button in the status bar.')
+            .setName("Hide Obsidian’s own Sync button")
+            .setDesc("Hides the built-in Obsidian Sync icon in the status bar so it doesn’t sit next to this plugin.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.hideNativeSyncStatus)
                 .onChange(async (value) => {
@@ -142,8 +166,8 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName("Enable Verbose Logging")
-            .setDesc("Outputs detailed sync information to the developer console for troubleshooting.")
+            .setName("Write extra details to the console")
+            .setDesc("Adds more sync information to the developer console. Turn this on if something is going wrong.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.verboseLogging)
                 .onChange(async (value) => {
@@ -183,11 +207,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     }));
         }
 
-        containerEl.createEl('h4', { text: "Selective Sync" });
+        containerEl.createEl('h4', { text: "Only these folders" });
         new Setting(containerEl)
-            .setName("Included folders")
-            .setDesc("Only sync folders in this list. One folder per line. If empty, all folders are included (unless excluded). Example: 'Journal/Daily'.")
-            .addTextArea(text => text.setPlaceholder("Path/To/Include\nAnother/Path").setValue(this.plugin.settings.includedFolders).onChange(async (value) => { this.plugin.settings.includedFolders = value; await this.plugin.saveSettings(); }));
+            .setName("Only sync these folders")
+            .setDesc("If you add folders here, only they sync. Leave this empty to sync everything except the folders you skipped above. One folder per line, like Journal/Daily.")
+            .addTextArea(text => text.setPlaceholder("Journal/Daily\nWork").setValue(this.plugin.settings.includedFolders).onChange(async (value) => { this.plugin.settings.includedFolders = value; await this.plugin.saveSettings(); }));
     }
 
     displayAdvancedSettings(containerEl: HTMLElement): void {
@@ -258,7 +282,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Strict security")
-            .setDesc("Only accept devices this vault has an encryption key for, and reject unencrypted messages from them. Recommended, but devices paired by typing a bare device ID will need to be paired again using the full copied code or the QR.")
+            .setDesc("Only accept devices this vault has an encryption key for, and reject unencrypted messages from them. Devices that were never paired with the full pairing code will need to pair again.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.strictSecurity)
                 .onChange(async (value) => {
@@ -398,8 +422,10 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         const peers = Array.from(this.plugin.clusterPeers.values());
         const signature = [
             status.text, status.icon, status.state, status.spin ? '1' : '0',
-            peers.map(p => `${p.deviceId}:${p.friendlyName}:${this.plugin.connections.has(p.deviceId) ? 1 : 0}`).join(','),
+            peers.map(p => `${p.deviceId}:${p.friendlyName}:${this.plugin.connections.has(p.deviceId) ? 1 : 0}:${this.plugin.settings.peerKeys[p.deviceId] ? 1 : 0}`).join(','),
             this.plugin.settings.companionPeerId ?? '',
+            this.plugin.directIpServer?.getPin() ?? '',
+            this.plugin.getLocalIps().map(a => a.address).join(','),
         ].join('|');
 
         if (signature === this.lastStatusSignature) return;
@@ -424,16 +450,31 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         this.clusterStatusEl.empty();
 
         const createEntry = (peer: PeerInfo, type: 'self' | 'companion' | 'peer' | 'host' | 'disconnected') => {
+            const hasKey = type === 'self' || !!this.plugin.settings.peerKeys[peer.deviceId];
+            const connected = type === 'self' || (this.plugin.connections.has(peer.deviceId) && this.plugin.connections.get(peer.deviceId)?.open);
+            const desc = type === 'self'
+                ? 'This device'
+                : type === 'host'
+                    ? 'Offline host'
+                    : `${connected ? 'Connected' : 'Saved'} · ${hasKey ? 'Encrypted' : 'Not encrypted — pair again with the full code'}`;
             const settingItem = new Setting(this.clusterStatusEl!)
-                .setDesc(`ID: ${peer.deviceId}`);
+                .setDesc(desc);
 
             if (type === 'self') {
-                this.createEditableName(settingItem.nameEl, peer.friendlyName + ' (This Device)', peer.friendlyName, async (newName) => {
-                    this.plugin.settings.friendlyName = newName;
-                    await this.plugin.saveSettings();
-                    this.plugin.broadcastData({ type: 'cluster-rename', targetDeviceId: this.plugin.settings.deviceId, newName });
-                    this.updateStatus();
+                this.createEditableName(settingItem.nameEl, peer.friendlyName + ' (this device)', peer.friendlyName, async (newName) => {
+                    await this.plugin.setFriendlyName(newName);
                 });
+                settingItem.addButton(btn => btn.setButtonText('New ID').onClick(() => {
+                    new ConfirmModal(this.app, {
+                        title: 'Give this device a new ID?',
+                        body: 'Use this if you copied the vault from another computer and both cannot stay online. You will need to pair again from Connect devices.',
+                        confirmText: 'Create new ID',
+                        onConfirm: async () => {
+                            await this.plugin.resetDeviceIdentity();
+                            this.updateStatus();
+                        },
+                    }).open();
+                }));
             } else if (type === 'peer' || type === 'disconnected') {
                 this.createEditableName(settingItem.nameEl, peer.friendlyName, peer.friendlyName, (newName) => {
                     this.plugin.broadcastData({ type: 'cluster-rename', targetDeviceId: peer.deviceId, newName });
@@ -443,6 +484,10 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 });
             } else {
                 settingItem.setName(peer.friendlyName);
+            }
+
+            if (type === 'companion') {
+                settingItem.nameEl.createSpan({ text: ' Primary', cls: 'od-primary-label' });
             }
 
             if (type === 'companion') {
@@ -461,13 +506,13 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             if (type === 'peer' || type === 'disconnected') {
                 settingItem.addExtraButton(btn => btn
                     .setIcon('star')
-                    .setTooltip('Set as Primary Sync Partner')
+                    .setTooltip('Set as Primary Sync Partner — reconnects automatically')
                     .onClick(async () => {
                         this.plugin.settings.companionPeerId = peer.deviceId;
                         await this.plugin.saveSettings();
                         // Tell the other device it is now paired with us — without this
                         // message the pairing was one-sided and the peer never knew.
-                        this.plugin.sendData(peer.deviceId, { type: 'companion-pair', peerInfo: this.plugin.getMyPeerInfo() });
+                        this.plugin.sendData(peer.deviceId, { type: 'companion-pair', peerInfo: persistablePeerInfo(this.plugin.getMyPeerInfo()) });
                         this.plugin.tryToConnectToClusterPeers();
                         this.updateStatus();
                     })
@@ -475,41 +520,50 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             }
             if (type === 'peer' || type === 'companion' || type === 'disconnected') {
                 const conn = this.plugin.connections.get(peer.deviceId);
+                const openPairing = () => new ConnectionModal(this.app, this.plugin).open();
                 if (conn && conn.open) {
+                    if (!hasKey) {
+                        // Gossip can list a device you never paired with. Reconnect/Disconnect
+                        // cannot create the key — only exchanging the full pairing code can.
+                        settingItem.addButton(btn => btn.setButtonText('Pair').setCta().onClick(openPairing));
+                    }
                     settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => {
                         conn.close();
                         this.plugin.showNotice(`Disconnecting from ${peer.friendlyName}`, 'important');
                         setTimeout(() => this.updateStatus(), 100);
                     }));
-                    settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Kick Device').onClick(() => {
+                    settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Remove from group').onClick(() => {
                         new ConfirmModal(this.app, {
                             title: `Remove ${peer.friendlyName} from the group?`,
-                            body: 'Every device in the group stops syncing with it. It can rejoin by pairing again.',
+                            body: `${peer.friendlyName} is forgotten on every device in the group and will not reconnect on its own. Pair again to add it back.`,
                             confirmText: 'Remove device',
                             onConfirm: () => {
-                                this.plugin.broadcastData({ type: 'cluster-kick', targetDeviceId: peer.deviceId });
-                                if (this.plugin.connections.has(peer.deviceId)) this.plugin.connections.get(peer.deviceId)?.close();
-                                setTimeout(() => this.updateStatus(), 100);
+                                void this.plugin.forgetDevice(peer.deviceId, { broadcast: true, kick: true });
                             },
                         }).open();
                     }));
-                    settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
-                        this.plugin.manualPingStart.set(peer.deviceId, Date.now());
-                        conn.send({ type: 'ping' });
-                    }));
+                    if (this.plugin.settings.syncMode === 'advanced') {
+                        settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
+                            this.plugin.manualPingStart.set(peer.deviceId, Date.now());
+                            conn.send({ type: 'ping' });
+                        }));
+                    }
                 } else {
-                    settingItem.setDesc((settingItem.descEl.textContent ?? '') + ' (Disconnected)');
                     settingItem.nameEl.style.color = 'var(--text-muted)';
-                    
-                    settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
-                        if (this.plugin.peer && !this.plugin.peer.disconnected) {
-                            this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`, 'important');
-                            const newConn = this.plugin.peer.connect(peer.deviceId, { reliable: true });
-                            this.plugin.setupConnection(newConn);
-                        } else {
-                            this.plugin.showNotice("Cannot reconnect: Your sync is offline.", 'error');
-                        }
-                    }));
+
+                    if (!hasKey) {
+                        settingItem.addButton(btn => btn.setButtonText('Pair').setCta().onClick(openPairing));
+                    } else {
+                        settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
+                            if (this.plugin.peer && !this.plugin.peer.disconnected) {
+                                this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`, 'important');
+                                const newConn = this.plugin.peer.connect(peer.deviceId, { reliable: true });
+                                this.plugin.setupConnection(newConn);
+                            } else {
+                                this.plugin.showNotice("Cannot reconnect: this device cannot reach the sync network yet.", 'error');
+                            }
+                        }));
+                    }
                     if (type !== 'companion') {
                         settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(() => {
                             new ConfirmModal(this.app, {
@@ -517,16 +571,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                                 body: 'This device is removed from your saved devices and its encryption key is deleted. You will need to pair again to sync with it.',
                                 confirmText: 'Forget device',
                                 onConfirm: () => {
-                                    this.plugin.pendingConnections.delete(peer.deviceId);
-                                    this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
-                                    this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
-                                    // Forgetting a device must also drop its pre-shared key; leaving it
-                                    // behind meant a "forgotten" peer could still be auto-trusted later.
-                                    delete this.plugin.settings.peerKeys[peer.deviceId];
-                                    this.plugin.invalidateCryptoKey(peer.deviceId);
-                                    void this.plugin.saveSettings();
-                                    this.plugin.saveKnownPeers();
-                                    setTimeout(() => this.updateStatus(), 100);
+                                    void this.plugin.forgetDevice(peer.deviceId, { broadcast: true });
                                 },
                             }).open();
                         }));
@@ -544,16 +589,56 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         if (this.plugin.getConnectionMode() === 'direct-ip') {
             const list = this.clusterStatusEl;
             if (this.plugin.directIpServer) {
-                list.createEl('p', { text: 'Hosting on Offline Mode. Other devices can connect to you.' });
+                const addrs = this.plugin.getLocalIps();
+                const ip = addrs[0]?.address ?? null;
+                const pin = this.plugin.directIpServer.getPin();
+                list.createEl('p', { text: 'This computer is hosting Offline Mode. Other devices join with the IP and token below.' });
+                renderHostAddresses(list, addrs, this.plugin.settings.directIpHostPort);
+                list.createEl('p', { text: `Token: ${pin}`, cls: 'od-pin-display od-token' });
+                new Setting(list)
+                    .addButton(btn => btn.setButtonText('Copy token').setCta().onClick(async () => {
+                        try {
+                            await navigator.clipboard.writeText(pin);
+                            new Notice('Token copied.');
+                        } catch {
+                            new Notice('Select the token and copy it (Ctrl+C / Cmd+C).');
+                        }
+                    }))
+                    .addButton(btn => btn.setButtonText('Copy IP and token').onClick(async () => {
+                        if (!ip) {
+                            new Notice('No network address to copy.');
+                            return;
+                        }
+                        try {
+                            await navigator.clipboard.writeText(`${ip}\n${pin}`);
+                            new Notice('IP and token copied.');
+                        } catch {
+                            new Notice('Select the IP and token and copy them (Ctrl+C / Cmd+C).');
+                        }
+                    }));
             } else if (this.plugin.directIpClient) {
                 // Look up the actual host entry — taking the FIRST clusterPeers value
                 // showed a stale, unrelated known peer as the connected host.
                 const hostInfo = this.plugin.clusterPeers.get('direct-ip-host');
                 if (hostInfo) createEntry(hostInfo, 'host');
             } else {
-                list.createEl('p', { text: 'Offline Mode is idle. Use the "Connect" button to start.' });
+                list.createEl('p', { text: 'Offline Mode is idle. Open Connect devices to start hosting, or join with an IP and token.' });
+                new Setting(list).addButton(btn => btn.setButtonText('Connect devices').setCta()
+                    .onClick(() => new ConnectionModal(this.app, this.plugin).open()));
             }
             return;
+        }
+
+        const unpaired = Array.from(this.plugin.clusterPeers.values())
+            .filter(p => !this.plugin.settings.peerKeys[p.deviceId]);
+        if (unpaired.length > 0) {
+            const names = unpaired.map(p => p.friendlyName).join(', ');
+            this.clusterStatusEl.createEl('p', {
+                text: unpaired.length === 1
+                    ? `${names} showed up in this list after you paired with someone else. That does not pair it with this device — tap Pair and use the full code from ${names}.`
+                    : `These devices are listed here but are not paired with this device: ${names}. Pairing is one-to-one — tap Pair on each row and use that device’s full code.`,
+                cls: 'od-text-muted'
+            });
         }
 
         const companionId = this.plugin.settings.companionPeerId;
@@ -570,11 +655,13 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         if (this.plugin.clusterPeers.size === 0) {
             const list = this.clusterStatusEl;
             if (!this.plugin.peer || this.plugin.peer.disconnected) {
-                list.createEl('p', { text: 'Sync is offline. Trying to reconnect...' });
+                list.createEl('p', { text: "Can't reach the sync network. Retrying…" });
             } else if (!this.plugin.peer.id) {
-                list.createEl('p', { text: 'Connecting to sync network...' });
+                list.createEl('p', { text: 'Connecting to the sync network…' });
             } else {
-                list.createEl('p', { text: 'Not connected to any other devices.' });
+                list.createEl('p', { text: 'No other devices yet. Open Connect devices on this computer and on the phone or laptop you want to pair.' });
+                new Setting(list).addButton(btn => btn.setButtonText('Connect devices').setCta()
+                    .onClick(() => new ConnectionModal(this.app, this.plugin).open()));
             }
         }
     }

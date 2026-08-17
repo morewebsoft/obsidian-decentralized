@@ -84,6 +84,10 @@ describe('DirectIpServer', () => {
         expect((server as any).clients.size).toBe(1);
     });
 
+    test('exposes the access token so the host screen can show it again', () => {
+        expect(server.getPin()).toBe('1234');
+    });
+
     test('should teardown cleanly on stop()', () => {
         // server is started in constructor
         

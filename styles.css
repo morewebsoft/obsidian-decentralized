@@ -63,7 +63,15 @@ body.od-hide-native-sync .status-bar-item.plugin-sync {
 .od-editable-name-input { margin: 0; height: 28px; background: var(--background-modifier-form-field); border: 1px solid var(--background-modifier-border-focus); border-radius: var(--radius-s); color: var(--text-normal); }
 .od-editable-name-submit { color: var(--interactive-success); cursor: pointer; display: flex; padding: 4px; border-radius: var(--radius-s); transition: background-color 0.15s; }
 .od-editable-name-submit:hover { background-color: var(--background-modifier-hover); }
-.od-setting-item-name-wrapper { display: flex; align-items: center; }
+.od-primary-label { color: var(--text-accent); font-size: 0.8em; font-weight: 600; margin-left: 6px; }
+.od-device-id-support { font-size: 0.8em; color: var(--text-muted); margin: 0 0 1em; cursor: pointer; word-break: break-all; }
+.od-setting-item-name-wrapper {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--size-4-2);
+    min-width: 0;
+}
 
 /* --- Connection / pairing modal (was ui.ts injectStyles) --- */
 .od-dashboard-header { text-align: center; margin-bottom: 5px; font-weight: 600; color: var(--text-normal); }
@@ -89,6 +97,7 @@ body.od-hide-native-sync .status-bar-item.plugin-sync {
 .od-peer-name { font-weight: bold; }
 .od-full-width { width: 100%; }
 .od-ip-display { font-size: 1.2em; text-align: center; margin: 10px; }
+.od-direct-ip-wrapper .od-text-muted { text-align: center; }
 .od-pin-display { font-size: 2em; font-weight: bold; text-align: center; margin: 20px; }
 .od-text-muted { color: var(--text-muted); }
 
@@ -107,9 +116,17 @@ body.od-hide-native-sync .status-bar-item.plugin-sync {
 
 /* Quick Pair specifics */
 .od-step-header { font-size: 1.1em; font-weight: 600; color: var(--text-normal); margin-top: 20px; margin-bottom: 10px; }
-.od-pairing-code-container { display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); border: 1px solid var(--background-modifier-border); margin: 10px 0; }
-.od-pairing-code-text { font-family: var(--font-monospace); font-size: 1.5em; font-weight: bold; letter-spacing: 0.05em; color: var(--text-normal); user-select: all; }
+.od-device-name-block { margin: 8px 0 16px; }
+.od-device-name-block .od-step-header { margin-top: 8px; }
+.od-device-name-block .mod-warning { margin-bottom: 8px; }
+.od-pairing-code-container { display: flex; flex-direction: column; align-items: stretch; gap: 10px; background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); border: 1px solid var(--background-modifier-border); margin: 10px 0; }
+.od-pairing-code-container button { width: 100%; }
+.od-pairing-code-text { font-family: var(--font-monospace); font-size: 0.85em; font-weight: 600; letter-spacing: 0.02em; color: var(--text-normal); user-select: all; word-break: break-all; line-height: 1.4; }
 .od-instruction-text { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 15px; }
+.od-pair-success { text-align: center; padding: 8px 0 16px; }
+.od-pair-success-title { font-size: 1.15em; font-weight: 600; margin-bottom: 8px; }
+.od-lan-card-wait { cursor: default; opacity: 0.85; }
+.od-lan-card-wait:hover { transform: none; border-color: var(--background-modifier-border); }
 
 .od-qr-section { display: flex; flex-direction: column; align-items: center; margin-top: 15px; padding: 15px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); }
 .od-qr-section img { width: 150px; height: 150px; border-radius: var(--radius-s); margin-bottom: 10px; }
@@ -132,6 +149,43 @@ body.od-hide-native-sync .status-bar-item.plugin-sync {
 .od-mobile .od-full-width { width: 100%; margin-top: 10px; }
 .od-mobile .od-input-row { flex-direction: column; }
 .od-mobile .od-input-row button { width: 100%; margin-top: 5px; }
+
+/* Plugin settings: Your devices actions (Pair / Forget / Reconnect) wrap on a narrow pane. */
+.community-plugin-settings:has(.obsidian-decentralized-status-text) .setting-item {
+    flex-wrap: wrap;
+    row-gap: var(--size-4-2);
+}
+.community-plugin-settings:has(.obsidian-decentralized-status-text) .setting-item-info {
+    min-width: 0;
+    flex: 1 1 12rem;
+}
+.community-plugin-settings:has(.obsidian-decentralized-status-text) .setting-item-name {
+    overflow-wrap: anywhere;
+}
+.community-plugin-settings:has(.obsidian-decentralized-status-text) .setting-item-control {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--size-4-2);
+    flex: 0 1 auto;
+    max-width: 100%;
+}
+.community-plugin-settings:has(.obsidian-decentralized-status-text) .setting-item-control > button {
+    min-height: var(--input-height);
+}
+
+.is-phone .community-plugin-settings:has(.obsidian-decentralized-status-text) .setting-item {
+    flex-direction: column;
+    align-items: stretch;
+}
+.is-phone .community-plugin-settings:has(.obsidian-decentralized-status-text) .setting-item-control {
+    justify-content: flex-start;
+    width: 100%;
+}
+.is-phone .community-plugin-settings:has(.obsidian-decentralized-status-text) .setting-item-control > button {
+    flex: 1 1 auto;
+}
 
 /* Classes previously applied as inline styles from TypeScript. */
 .od-spaced-top { margin-top: 20px; }

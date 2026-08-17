@@ -99,6 +99,19 @@ export function sanitizeVaultPath(rawPath: unknown): string | null {
     return segments.join('/');
 }
 
+/** Inverse of getConflictPath: `Note (conflict on 2024-01-02).md` → `Note.md`. */
+const CONFLICT_COPY_RE = /^(.*) \(conflict on \d{4}-\d{2}-\d{2}(?: \d+)?\)(\.[^./]+)?$/;
+
+export function originalPathFromConflictCopy(path: string): string | null {
+    const normalized = path.replace(/\\/g, '/');
+    const lastSlash = normalized.lastIndexOf('/');
+    const dir = lastSlash >= 0 ? normalized.slice(0, lastSlash + 1) : '';
+    const name = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
+    const match = name.match(CONFLICT_COPY_RE);
+    if (!match || !match[1]) return null;
+    return dir + match[1] + (match[2] || '');
+}
+
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
     try {
         let binary = '';

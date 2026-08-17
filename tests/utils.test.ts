@@ -9,7 +9,8 @@ import {
     splitBinaryPayload,
     joinBinaryPayload,
     packFrame,
-    unpackFrame
+    unpackFrame,
+    originalPathFromConflictCopy,
 } from '../src/utils';
 
 // Mock window.btoa and window.atob for Node environment
@@ -278,5 +279,22 @@ describe('Chunked reassembly offset math', () => {
         buffer.set(senderChunk1, offset);
 
         expect(buffer).not.toEqual(source);
+    });
+});
+
+describe('originalPathFromConflictCopy', () => {
+    it('maps a dated conflict copy back to the original note', () => {
+        expect(originalPathFromConflictCopy('My Note (conflict on 2023-10-27).md')).toBe('My Note.md');
+        expect(originalPathFromConflictCopy('Journal/Daily (conflict on 2026-08-16).md')).toBe('Journal/Daily.md');
+    });
+
+    it('handles a second copy the same day and files with no extension', () => {
+        expect(originalPathFromConflictCopy('My Note (conflict on 2023-10-27 2).md')).toBe('My Note.md');
+        expect(originalPathFromConflictCopy('Todo (conflict on 2023-10-27)')).toBe('Todo');
+    });
+
+    it('returns null for ordinary notes', () => {
+        expect(originalPathFromConflictCopy('My Note.md')).toBeNull();
+        expect(originalPathFromConflictCopy('Note (copy).md')).toBeNull();
     });
 });

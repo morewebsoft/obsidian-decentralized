@@ -94,6 +94,12 @@ export type PeerInfo = {
     ip: string | null;
     port?: number;
     mode?: 'peerjs' | 'direct-ip';
+    /**
+     * Ephemeral. Present on a LAN beacon only while that device's pairing
+     * window is open, so a nearby tap can pair with the encryption key.
+     * Never persist or gossip this field.
+     */
+    pairingKey?: string;
 };
 
 export type DiscoveryBeacon = {
@@ -529,6 +535,8 @@ export interface ObsidianDecentralizedSettings {
     enableEncryption: boolean;
     enableRealtimeSync: boolean;
     peerKeys: Record<string, string>; // peerId -> base64 PSK
+    /** Device IDs the user removed. Handshake/gossip must not put them back until they pair again. */
+    blockedPeers: string[];
 }
 
 export interface TwoDeviceState {
@@ -570,6 +578,7 @@ export const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     enableEncryption: true,
     enableRealtimeSync: true,
     peerKeys: {},
+    blockedPeers: [],
 };
 
 export interface ILANDiscovery {

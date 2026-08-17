@@ -81,6 +81,31 @@ describe('DesktopLANDiscovery', () => {
         expect(discoveredPeer.ip).toBe('192.168.1.5');
     });
 
+    test('re-emits discover when a known peer starts advertising a pairing key', () => {
+        const discoverSpy = jest.fn();
+        discovery.on('discover', discoverSpy);
+        discovery.startListening();
+
+        const socket = (discovery as any).socket;
+        const base = {
+            type: 'obsidian-decentralized-beacon',
+            peerInfo: { deviceId: 'other-device', friendlyName: 'Other PC' }
+        };
+        socket.emit('message', Buffer.from(JSON.stringify(base)), { address: '192.168.1.5' });
+        expect(discoverSpy).toHaveBeenCalledTimes(1);
+
+        socket.emit('message', Buffer.from(JSON.stringify(base)), { address: '192.168.1.5' });
+        expect(discoverSpy).toHaveBeenCalledTimes(1);
+
+        const withKey = {
+            type: 'obsidian-decentralized-beacon',
+            peerInfo: { deviceId: 'other-device', friendlyName: 'Other PC', pairingKey: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' }
+        };
+        socket.emit('message', Buffer.from(JSON.stringify(withKey)), { address: '192.168.1.5' });
+        expect(discoverSpy).toHaveBeenCalledTimes(2);
+        expect(discoverSpy.mock.calls[1][0].pairingKey).toBe('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=');
+    });
+
     test('should emit lose when a peer times out', () => {
         const discoverSpy = jest.fn();
         const loseSpy = jest.fn();
